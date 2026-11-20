@@ -77,7 +77,9 @@ func run(logger *slog.Logger) error {
 		logger.Warn("initial JWKS refresh failed")
 	}
 	go cache.Run(ctx)
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -86,7 +88,10 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 	logger.Info("server starting")
-	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	err = server.Serve(listener)
+	stop()
+	<-shutdownDone
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return errors.New("HTTP server failed")
 	}
 	return nil
