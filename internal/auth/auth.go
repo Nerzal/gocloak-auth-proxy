@@ -130,6 +130,7 @@ func (v *Verifier) key(ctx context.Context, t *jwt.Token) (any, error) {
 		}
 	case "ES256":
 		k, ok := key.(*ecdsa.PublicKey)
+		//nolint:staticcheck // Guard against nil coordinates that panic inside crypto/ecdsa.Verify.
 		if !ok || k == nil || k.Curve != elliptic.P256() || k.X == nil || k.Y == nil {
 			return nil, errInvalid
 		}

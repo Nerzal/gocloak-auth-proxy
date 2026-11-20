@@ -167,7 +167,7 @@ func TestAuthorizationAndKeyValidation(t *testing.T) {
 			t.Fatalf("expected forbidden for %#v, got %v", tc, err)
 		}
 	}
-	for _, invalid := range []any{nil, "secret", &rsa.PublicKey{}, &ecdsa.PublicKey{}, key} {
+	for _, invalid := range []any{nil, "secret", &rsa.PublicKey{}, &ecdsa.PublicKey{}, &ecdsa.PublicKey{Curve: elliptic.P256()}, key} {
 		if _, err := verifier(t, invalid, 0, nil, nil).Verify(context.Background(), token); err == nil || errors.Is(err, ErrForbidden) {
 			t.Fatalf("accepted invalid key %T: %v", invalid, err)
 		}
