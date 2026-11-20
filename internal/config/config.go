@@ -16,6 +16,10 @@ type Config struct {
 	UpstreamURL         string
 	ListenAddr          string
 	ClientID            string
+	HeaderUser          string
+	HeaderEmail         string
+	HeaderGroups        string
+	HeaderRoles         string
 	RequiredRealmRoles  []string
 	RequiredClientRoles []string
 	JWKSRefreshInterval time.Duration
@@ -29,6 +33,10 @@ func Load() (Config, error) {
 		UpstreamURL:         os.Getenv("UPSTREAM_URL"),
 		ListenAddr:          envDefault("LISTEN_ADDR", ":8080"),
 		ClientID:            os.Getenv("CLIENT_ID"),
+		HeaderUser:          os.Getenv("HEADER_USER"),
+		HeaderEmail:         os.Getenv("HEADER_EMAIL"),
+		HeaderGroups:        os.Getenv("HEADER_GROUPS"),
+		HeaderRoles:         os.Getenv("HEADER_ROLES"),
 		RequiredRealmRoles:  roles(os.Getenv("REQUIRED_REALM_ROLES")),
 		RequiredClientRoles: roles(os.Getenv("REQUIRED_CLIENT_ROLES")),
 	}
@@ -95,10 +103,18 @@ func (c Config) Validate() error {
 	if c.ClockSkew < 0 || c.ClockSkew > 30*time.Second {
 		return errors.New("CLOCK_SKEW must be between 0 and 30s")
 	}
+	if c.ClientID != "" && strings.TrimSpace(c.ClientID) != c.ClientID {
+		return errors.New("CLIENT_ID must not contain leading or trailing whitespace")
+	}
 	if len(c.RequiredClientRoles) > 0 && c.ClientID == "" {
 		return errors.New("CLIENT_ID is required for client roles")
 	}
-	for _, role := range append(c.RequiredRealmRoles, c.RequiredClientRoles...) {
+	for _, role := range c.RequiredRealmRoles {
+		if role == "" {
+			return errors.New("role names must not be empty")
+		}
+	}
+	for _, role := range c.RequiredClientRoles {
 		if role == "" {
 			return errors.New("role names must not be empty")
 		}

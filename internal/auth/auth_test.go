@@ -25,7 +25,7 @@ func (k testKeys) Key(_ context.Context, _, _ string) (any, error) { return k.ke
 func validClaims() jwt.MapClaims {
 	now := time.Now()
 	return jwt.MapClaims{
-		"iss": "issuer", "aud": []string{"audience", "other"},
+		"iss": "issuer", "aud": []string{"audience", "other"}, "typ": "Bearer",
 		"exp": now.Add(time.Minute).Unix(), "nbf": now.Add(-time.Minute).Unix(), "iat": now.Add(-time.Minute).Unix(),
 		"sub": "subject", "preferred_username": "alice", "email": "alice@example.test",
 		"groups":       []string{"one", "two"},
@@ -87,6 +87,12 @@ func TestVerify(t *testing.T) {
 			if err != nil || !reflect.DeepEqual(got, want) {
 				t.Fatalf("got %#v, %v; want %#v", got, err, want)
 			}
+			// Standard Keycloak access tokens omit nbf by default.
+			noNbf := validClaims()
+			delete(noNbf, "nbf")
+			if _, err := v.Verify(context.Background(), signed(t, tc.method, tc.key, noNbf, nil)); err != nil {
+				t.Fatalf("rejected token without nbf: %v", err)
+			}
 		})
 	}
 }
@@ -106,18 +112,24 @@ func TestVerifyRejectsInvalidTokens(t *testing.T) {
 		{"wrong issuer", func(c jwt.MapClaims) { c["iss"] = "wrong" }, nil},
 		{"missing audience", func(c jwt.MapClaims) { delete(c, "aud") }, nil},
 		{"wrong audience", func(c jwt.MapClaims) { c["aud"] = "wrong" }, nil},
+		{"missing typ", func(c jwt.MapClaims) { delete(c, "typ") }, nil},
+		{"id token typ", func(c jwt.MapClaims) { c["typ"] = "ID" }, nil},
+		{"refresh token typ", func(c jwt.MapClaims) { c["typ"] = "Refresh" }, nil},
 		{"missing exp", func(c jwt.MapClaims) { delete(c, "exp") }, nil},
 		{"expired", func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Minute).Unix() }, nil},
-		{"missing nbf", func(c jwt.MapClaims) { delete(c, "nbf") }, nil},
 		{"future nbf", func(c jwt.MapClaims) { c["nbf"] = time.Now().Add(time.Minute).Unix() }, nil},
 		{"missing iat", func(c jwt.MapClaims) { delete(c, "iat") }, nil},
 		{"future iat", func(c jwt.MapClaims) { c["iat"] = time.Now().Add(time.Minute).Unix() }, nil},
 		{"wrong exp type", func(c jwt.MapClaims) { c["exp"] = "tomorrow" }, nil},
 		{"bad groups type", func(c jwt.MapClaims) { c["groups"] = "admin" }, nil},
 		{"user injection", func(c jwt.MapClaims) { c["preferred_username"] = "a\r\nX-Admin: true" }, nil},
+		{"user surrounding space", func(c jwt.MapClaims) { c["preferred_username"] = " alice " }, nil},
 		{"email injection", func(c jwt.MapClaims) { c["email"] = "a\nb" }, nil},
 		{"group injection", func(c jwt.MapClaims) { c["groups"] = []string{"a\rb"} }, nil},
 		{"role injection", func(c jwt.MapClaims) { c["realm_access"] = map[string]any{"roles": []string{"a\nb"}} }, nil},
+		{"role surrounding space", func(c jwt.MapClaims) { c["realm_access"] = map[string]any{"roles": []string{" admin "}} }, nil},
+		{"empty user and subject", func(c jwt.MapClaims) { delete(c, "preferred_username"); delete(c, "sub") }, nil},
+		{"whitespace user and empty sub", func(c jwt.MapClaims) { c["preferred_username"] = "   "; delete(c, "sub") }, nil},
 		{"no kid", nil, map[string]any{"kid": nil}},
 		{"critical extension", nil, map[string]any{"crit": []string{"example"}}},
 		{"b64 extension", nil, map[string]any{"b64": true}},
@@ -244,16 +256,34 @@ func TestSkewAndConfiguration(t *testing.T) {
 }
 
 func BenchmarkVerify(b *testing.B) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		b.Fatal(err)
 	}
-	v := verifier(b, &key.PublicKey, 0, []string{"reader"}, []string{"writer"})
-	token := signed(b, jwt.SigningMethodES256, key, validClaims(), nil)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, err := v.Verify(context.Background(), token); err != nil {
-			b.Fatal(err)
-		}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		b.Fatal(err)
 	}
+	b.Run("ES256", func(b *testing.B) {
+		v := verifier(b, &ecKey.PublicKey, 0, []string{"reader"}, []string{"writer"})
+		token := signed(b, jwt.SigningMethodES256, ecKey, validClaims(), nil)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if _, err := v.Verify(context.Background(), token); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("RS256", func(b *testing.B) {
+		v := verifier(b, &rsaKey.PublicKey, 0, []string{"reader"}, []string{"writer"})
+		token := signed(b, jwt.SigningMethodRS256, rsaKey, validClaims(), nil)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if _, err := v.Verify(context.Background(), token); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

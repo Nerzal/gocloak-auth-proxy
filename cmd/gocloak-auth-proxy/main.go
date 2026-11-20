@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -27,27 +28,29 @@ func main() {
 	}
 }
 
-func run(logger *slog.Logger) error {
-	cfg, err := config.Load()
+func buildHandler(cfg config.Config, logger *slog.Logger) (http.Handler, *jwks.Cache, error) {
+	cache, err := jwks.New(cfg.Issuer, cfg.JWKSRefreshInterval, logger)
 	if err != nil {
-		return errors.New("invalid configuration")
-	}
-	cache, err := jwks.New(cfg.Issuer, cfg.JWKSRefreshInterval)
-	if err != nil {
-		return errors.New("invalid JWKS configuration")
+		return nil, nil, fmt.Errorf("invalid JWKS configuration: %w", err)
 	}
 	verifier, err := auth.New(cache, cfg.Issuer, cfg.Audience, cfg.ClockSkew, cfg.RequiredRealmRoles, cfg.RequiredClientRoles, cfg.ClientID)
 	if err != nil {
-		return errors.New("invalid authentication configuration")
+		return nil, nil, fmt.Errorf("invalid authentication configuration: %w", err)
+	}
+	headers := proxy.HeaderNames{
+		User:   cfg.HeaderUser,
+		Email:  cfg.HeaderEmail,
+		Groups: cfg.HeaderGroups,
+		Roles:  cfg.HeaderRoles,
 	}
 	var handler http.Handler
 	if cfg.UpstreamURL == "" {
-		handler, err = proxy.NewForwardAuth(verifier, proxy.HeaderNames{})
+		handler, err = proxy.NewForwardAuth(verifier, headers)
 	} else {
-		handler, err = proxy.NewReverseProxy(verifier, cfg.UpstreamURL, proxy.HeaderNames{})
+		handler, err = proxy.NewReverseProxy(verifier, cfg.UpstreamURL, headers, logger)
 	}
 	if err != nil {
-		return errors.New("invalid proxy configuration")
+		return nil, nil, fmt.Errorf("invalid proxy configuration: %w", err)
 	}
 	mux := http.NewServeMux()
 	operational := health.New(cache)
@@ -57,6 +60,18 @@ func run(logger *slog.Logger) error {
 		mux.Handle("/auth", handler)
 	} else {
 		mux.Handle("/", handler)
+	}
+	return mux, cache, nil
+}
+
+func run(logger *slog.Logger) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	mux, cache, err := buildHandler(cfg, logger)
+	if err != nil {
+		return err
 	}
 	server := &http.Server{
 		Handler:           mux,
@@ -68,7 +83,7 @@ func run(logger *slog.Logger) error {
 	}
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		return errors.New("cannot listen on configured address")
+		return fmt.Errorf("cannot listen on %s: %w", cfg.ListenAddr, err)
 	}
 	defer func() { _ = listener.Close() }()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -76,7 +91,11 @@ func run(logger *slog.Logger) error {
 	if err := cache.Refresh(ctx); err != nil {
 		logger.Warn("initial JWKS refresh failed")
 	}
-	go cache.Run(ctx)
+	cacheDone := make(chan struct{})
+	go func() {
+		defer close(cacheDone)
+		cache.Run(ctx)
+	}()
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -87,12 +106,13 @@ func run(logger *slog.Logger) error {
 			_ = server.Close()
 		}
 	}()
-	logger.Info("server starting")
+	logger.Info("server starting", "addr", cfg.ListenAddr)
 	err = server.Serve(listener)
 	stop()
 	<-shutdownDone
+	<-cacheDone
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return errors.New("HTTP server failed")
+		return fmt.Errorf("HTTP server failed: %w", err)
 	}
 	return nil
 }

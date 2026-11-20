@@ -7,10 +7,12 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -29,6 +31,9 @@ const (
 	unknownKidCooldown = 30 * time.Second
 	maxSnapshotAge     = 24 * time.Hour
 	minSnapshotAge     = time.Minute
+	initialRetryDelay  = time.Second
+	maxRetryDelay      = 30 * time.Second
+	failureLogCooldown = 30 * time.Second
 )
 
 type signingKey struct {
@@ -48,21 +53,23 @@ type flight struct {
 
 // Cache holds an immutable, atomically replaced set of public signing keys.
 type Cache struct {
-	baseURL, realm string
-	interval       time.Duration
-	maxAge         time.Duration
-	transport      *boundedTransport
-	current        atomic.Pointer[snapshot]
-	mu             sync.Mutex
-	inflight       *flight
-	lastAttempt    time.Time
-	lastErr        error
+	baseURL         string
+	realm           string
+	interval        time.Duration
+	maxAge          time.Duration
+	transport       *boundedTransport
+	logger          *slog.Logger
+	current         atomic.Pointer[snapshot]
+	mu              sync.Mutex
+	inflight        *flight
+	lastOnDemand    time.Time
+	lastOnDemandErr error
 }
 
 // New validates a Keycloak realm issuer. Plain HTTP is permitted only for
 // localhost and loopback IPs, for local development. The refresh interval must
-// be positive and no longer than 12 hours.
-func New(issuer string, refreshInterval time.Duration) (*Cache, error) {
+// be positive and no longer than 12 hours. A nil logger discards diagnostics.
+func New(issuer string, refreshInterval time.Duration, logger *slog.Logger) (*Cache, error) {
 	if refreshInterval <= 0 || refreshInterval > maxSnapshotAge/2 {
 		return nil, errors.New("JWKS refresh interval must be between zero and 12 hours")
 	}
@@ -91,14 +98,32 @@ func New(issuer string, refreshInterval time.Duration) (*Cache, error) {
 	u.Path = strings.Join(parts[:len(parts)-2], "/")
 	base := strings.TrimRight(u.String(), "/")
 	certURL := issuer + "/protocol/openid-connect/certs"
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: fetchTimeout,
+		ExpectContinueTimeout: time.Second,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	maxAge := maxSnapshotAge
 	if refreshInterval < maxSnapshotAge/2 {
 		maxAge = max(refreshInterval*2, minSnapshotAge)
 	}
 	return &Cache{
-		baseURL: base, realm: realm, interval: refreshInterval, maxAge: maxAge,
+		baseURL:   base,
+		realm:     realm,
+		interval:  refreshInterval,
+		maxAge:    maxAge,
 		transport: &boundedTransport{base: transport, target: certURL},
+		logger:    logger,
 	}, nil
 }
 
@@ -115,19 +140,9 @@ func (c *Cache) usable() *snapshot {
 	return s
 }
 
-func copyKey(key any) any {
-	switch k := key.(type) {
-	case *rsa.PublicKey:
-		return &rsa.PublicKey{N: new(big.Int).Set(k.N), E: k.E}
-	case *ecdsa.PublicKey:
-		return &ecdsa.PublicKey{Curve: k.Curve, X: new(big.Int).Set(k.X), Y: new(big.Int).Set(k.Y)}
-	default:
-		return nil
-	}
-}
-
-// Key returns a key only when both kid and algorithm match. Unknown kids
-// trigger a coalesced, rate-limited refresh, including on the initial lookup.
+// Key returns an immutable public verification key when both kid and algorithm
+// match. Callers must treat the returned key as read-only. Unknown kids trigger
+// a coalesced, rate-limited refresh, including on the initial lookup.
 func (c *Cache) Key(ctx context.Context, kid, alg string) (any, error) {
 	if kid == "" || len(kid) > 256 || (alg != "RS256" && alg != "ES256") {
 		return nil, errors.New("invalid key ID or unsupported signing algorithm")
@@ -137,7 +152,7 @@ func (c *Cache) Key(ctx context.Context, kid, alg string) (any, error) {
 			if k.alg != alg {
 				return nil, errors.New("signing algorithm does not match key")
 			}
-			return copyKey(k.key), nil
+			return k.key, nil
 		}
 	}
 	if err := c.refresh(ctx, true); err != nil {
@@ -145,7 +160,7 @@ func (c *Cache) Key(ctx context.Context, kid, alg string) (any, error) {
 	}
 	if s := c.usable(); s != nil {
 		if k, ok := s.keys[kid]; ok && k.alg == alg {
-			return copyKey(k.key), nil
+			return k.key, nil
 		}
 	}
 	return nil, errors.New("unknown signing key or algorithm mismatch")
@@ -155,7 +170,7 @@ func (c *Cache) Key(ctx context.Context, kid, alg string) (any, error) {
 // for startup readiness checks and does not apply the unknown-kid cooldown.
 func (c *Cache) Refresh(ctx context.Context) error { return c.refresh(ctx, false) }
 
-func (c *Cache) refresh(ctx context.Context, cooldown bool) error {
+func (c *Cache) refresh(ctx context.Context, onDemand bool) error {
 	c.mu.Lock()
 	if pending := c.inflight; pending != nil {
 		c.mu.Unlock()
@@ -166,19 +181,42 @@ func (c *Cache) refresh(ctx context.Context, cooldown bool) error {
 			return pending.err
 		}
 	}
-	if cooldown && time.Since(c.lastAttempt) < unknownKidCooldown {
-		err := c.lastErr
+	if onDemand && !c.lastOnDemand.IsZero() && time.Since(c.lastOnDemand) < unknownKidCooldown {
+		err := c.lastOnDemandErr
 		c.mu.Unlock()
 		return err
 	}
 	pending := &flight{done: make(chan struct{})}
 	c.inflight = pending
-	c.lastAttempt = time.Now()
+	if onDemand {
+		c.lastOnDemand = time.Now()
+	}
 	c.mu.Unlock()
+
+	if onDemand {
+		// Detach the shared on-demand fetch from the first caller's cancellation
+		// so a client disconnect cannot abort refreshes for other waiters or
+		// poison the unknown-kid cooldown.
+		fetchCtx := context.WithoutCancel(ctx)
+		go func() {
+			err := c.fetch(fetchCtx)
+			c.mu.Lock()
+			c.lastOnDemandErr = err
+			pending.err = err
+			c.inflight = nil
+			close(pending.done)
+			c.mu.Unlock()
+		}()
+		select {
+		case <-ctx.Done():
+			return errors.New("JWKS refresh canceled")
+		case <-pending.done:
+			return pending.err
+		}
+	}
 
 	err := c.fetch(ctx)
 	c.mu.Lock()
-	c.lastErr = err
 	pending.err = err
 	c.inflight = nil
 	close(pending.done)
@@ -230,17 +268,41 @@ func parseKeys(rawKeys []gocloak.CertResponseKey) (map[string]signingKey, error)
 	return keys, nil
 }
 
-// Run refreshes periodically until ctx is cancelled. Call Refresh first when
-// readiness must be established before serving traffic.
+// Run refreshes periodically until ctx is cancelled. While no usable snapshot
+// is available or after a refresh failure, it retries with bounded exponential
+// backoff before resuming the configured refresh interval.
 func (c *Cache) Run(ctx context.Context) {
-	ticker := time.NewTicker(c.interval)
-	defer ticker.Stop()
+	baseRetry := min(initialRetryDelay, c.interval)
+	maxRetry := min(maxRetryDelay, c.interval)
+	delay := c.interval
+	retryDelay := baseRetry
+	if !c.Ready() {
+		delay = baseRetry
+	}
+	var lastFailureLog time.Time
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			_ = c.Refresh(ctx)
+		case <-timer.C:
+			if err := c.Refresh(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if lastFailureLog.IsZero() || time.Since(lastFailureLog) >= failureLogCooldown {
+					c.logger.Warn("periodic JWKS refresh failed", "ready", c.Ready())
+					lastFailureLog = time.Now()
+				}
+				delay = retryDelay
+				retryDelay = min(retryDelay*2, maxRetry)
+			} else {
+				delay = c.interval
+				retryDelay = baseRetry
+			}
+			timer.Reset(delay)
 		}
 	}
 }

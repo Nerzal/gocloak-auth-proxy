@@ -16,27 +16,36 @@ Configure the process with environment variables:
 | `CLIENT_ID` | Keycloak client ID; required when `REQUIRED_CLIENT_ROLES` is set. |
 | `REQUIRED_REALM_ROLES` | Comma-separated required realm roles. |
 | `REQUIRED_CLIENT_ROLES` | Comma-separated required roles for `CLIENT_ID`. |
+| `HEADER_USER` | Optional. Identity header name for the verified username/subject; default `X-Auth-Request-User`. |
+| `HEADER_EMAIL` | Optional. Identity header name for the verified email; default `X-Auth-Request-Email`. |
+| `HEADER_GROUPS` | Optional. Identity header name for verified groups; default `X-Auth-Request-Groups`. |
+| `HEADER_ROLES` | Optional. Identity header name for verified roles; default `X-Auth-Request-Roles`. |
 | `JWKS_REFRESH_INTERVAL` | JWKS refresh interval as a Go duration; default `5m`, allowed `1s`–`12h`. |
 | `CLOCK_SKEW` | Token validation clock tolerance as a Go duration; default `30s`, allowed `0s`–`30s`. |
 
-All configured roles are required. The issuer, audience, expiration, not-before,
-and issued-at claims are checked. Do not send access tokens to untrusted
+All configured roles are required. Tokens must be access tokens (`typ: "Bearer"`)
+with valid `iss`, `aud`, `exp`, and `iat` claims (`nbf` is validated when
+present; configure an Audience protocol mapper in Keycloak if your realm tokens
+do not include the target `AUDIENCE`). Do not send access tokens to untrusted
 services. Use HTTPS for the issuer in production, and terminate TLS at a trusted
 ingress. Restrict access to the proxy and upstream to trusted networks; do not
 allow clients to bypass the proxy. The service itself listens over HTTP.
 
 `/healthz` and `/readyz` are unauthenticated health endpoints. Without an
 upstream, use `/auth` as the forward-auth endpoint. With `UPSTREAM_URL` set,
-other requests are reverse-proxied to that upstream.
+other requests are reverse-proxied to that upstream (note that `/healthz` and
+`/readyz` are reserved by the proxy).
 
 ## Architecture and integration
 
 The proxy retrieves Keycloak realm signing keys and validates bearer tokens
 locally. Successful authentication exposes the verified user, email, groups and
 roles as `X-Auth-Request-User`, `X-Auth-Request-Email`,
-`X-Auth-Request-Groups`, and `X-Auth-Request-Roles`. In reverse-proxy mode,
-client-supplied identity and forwarding headers and the bearer token are
-removed before forwarding; verified identity headers are then added.
+`X-Auth-Request-Groups`, and `X-Auth-Request-Roles` (or the configured
+`HEADER_*` names). In reverse-proxy mode, client-supplied identity, forwarding
+(`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, including underscore aliases), and
+bearer headers are removed before forwarding; verified identity headers are then
+added.
 
 For forward-auth, the ingress must pass the bearer `Authorization` header to
 `/auth`, deny access when it fails, and overwrite any client-supplied identity
@@ -74,12 +83,28 @@ location / {
 This example intentionally forwards only the listed request headers. Add other
 headers only after reviewing whether clients may safely control them.
 
+With Traefik's `forwardAuth` middleware:
+
+```yaml
+http:
+  middlewares:
+    keycloak-auth:
+      forwardAuth:
+        address: "http://auth-proxy:8080/auth"
+        trustForwardHeader: false
+        authResponseHeaders:
+          - "X-Auth-Request-User"
+          - "X-Auth-Request-Email"
+          - "X-Auth-Request-Groups"
+          - "X-Auth-Request-Roles"
+```
+
 In reverse-proxy mode instead, set `UPSTREAM_URL` to the application URL and
 route traffic to the proxy; no ingress auth subrequest is needed.
 
 ## Run
 
-Go 1.25 or newer is required.
+Go 1.26 or newer is required.
 
 ```sh
 export ISSUER=https://keycloak.example.com/realms/myrealm

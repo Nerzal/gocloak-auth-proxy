@@ -1,6 +1,6 @@
 module github.com/Nerzal/gocloak-auth-proxy
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/Nerzal/gocloak/v14 v14.0.4
@@ -13,5 +13,5 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/segmentio/ksuid v1.0.4 // indirect
 	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/net v0.63.0 // indirect
 )

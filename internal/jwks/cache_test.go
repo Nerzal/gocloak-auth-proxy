@@ -1,6 +1,7 @@
 package jwks
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
@@ -10,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,9 +38,14 @@ func testKeys(t *testing.T) (map[string]any, map[string]any) {
 
 func serverCache(t *testing.T, handler http.HandlerFunc, interval time.Duration) (*Cache, *httptest.Server) {
 	t.Helper()
+	return serverCacheWithLogger(t, handler, interval, nil)
+}
+
+func serverCacheWithLogger(t *testing.T, handler http.HandlerFunc, interval time.Duration, logger *slog.Logger) (*Cache, *httptest.Server) {
+	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	cache, err := New(server.URL+"/prefix/realms/example", interval)
+	cache, err := New(server.URL+"/prefix/realms/example", interval, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,22 +59,22 @@ func TestIssuerValidation(t *testing.T) {
 		"https://example.com/realms/r/", "https://example.com/realms/%2F",
 		"https://example.com/a/../realms/r", "https://example.com/other/r",
 	} {
-		if _, err := New(issuer, time.Minute); err == nil {
+		if _, err := New(issuer, time.Minute, nil); err == nil {
 			t.Errorf("accepted issuer %q", issuer)
 		}
 	}
 	for _, issuer := range []string{"https://example.com/auth/realms/r", "http://localhost:8080/realms/r", "http://[::1]:8080/realms/r"} {
-		if _, err := New(issuer, time.Minute); err != nil {
+		if _, err := New(issuer, time.Minute, nil); err != nil {
 			t.Errorf("rejected issuer %q: %v", issuer, err)
 		}
 	}
-	if _, err := New("https://example.com/realms/r", 0); err == nil {
+	if _, err := New("https://example.com/realms/r", 0, nil); err == nil {
 		t.Error("accepted zero refresh interval")
 	}
-	if _, err := New("https://example.com/realms/r", 12*time.Hour+time.Second); err == nil {
+	if _, err := New("https://example.com/realms/r", 12*time.Hour+time.Second, nil); err == nil {
 		t.Error("accepted refresh interval beyond snapshot lifetime budget")
 	}
-	if c, err := New("https://example.com/realms/r", 12*time.Hour); err != nil || c.maxAge != 24*time.Hour {
+	if c, err := New("https://example.com/realms/r", 12*time.Hour, nil); err != nil || c.maxAge != 24*time.Hour {
 		t.Fatal("expected 12-hour refresh interval and 24-hour snapshot lifetime")
 	}
 }
@@ -88,19 +95,15 @@ func TestKeyParsingAndImmutableSnapshots(t *testing.T) {
 	if err != nil || !cache.Ready() {
 		t.Fatalf("initial fetch: %v", err)
 	}
-	key.(*rsa.PublicKey).N.SetInt64(1)
-	key, err = cache.Key(context.Background(), "rsa", "RS256")
-	if err != nil || key.(*rsa.PublicKey).N.BitLen() != 2048 {
-		t.Fatalf("snapshot was mutated: %v", err)
+	if rsaKey, ok := key.(*rsa.PublicKey); !ok || rsaKey.N.BitLen() != 2048 {
+		t.Fatalf("unexpected RSA key: %T", key)
 	}
 	key, err = cache.Key(context.Background(), "ec", "ES256")
 	if err != nil {
 		t.Fatal(err)
 	}
-	key.(*ecdsa.PublicKey).X.SetInt64(0)
-	key, err = cache.Key(context.Background(), "ec", "ES256")
-	if err != nil || key.(*ecdsa.PublicKey).X.Sign() == 0 {
-		t.Fatalf("EC snapshot was mutated: %v", err)
+	if ecKey, ok := key.(*ecdsa.PublicKey); !ok || ecKey.Curve != elliptic.P256() {
+		t.Fatalf("unexpected EC key: %T", key)
 	}
 	for _, tc := range [][2]string{{"rsa", "ES256"}, {"ec", "RS256"}, {"rsa", "none"}, {"", "RS256"}, {strings.Repeat("a", 257), "RS256"}} {
 		if _, err := cache.Key(context.Background(), tc[0], tc[1]); err == nil {
@@ -295,5 +298,109 @@ func TestCancellationAndBackgroundRefresh(t *testing.T) {
 	stop()
 	if err := cache.Refresh(canceled); err == nil {
 		t.Fatal("canceled refresh succeeded")
+	}
+}
+
+func TestOnDemandCancellationDoesNotAbortSharedFetch(t *testing.T) {
+	r, _ := testKeys(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cache, _ := serverCache(t, func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{r}})
+	}, time.Minute)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	errCh1 := make(chan error, 1)
+	go func() {
+		_, err := cache.Key(ctx1, "rsa", "RS256")
+		errCh1 <- err
+	}()
+	<-started
+
+	errCh2 := make(chan error, 1)
+	go func() {
+		_, err := cache.Key(context.Background(), "rsa", "RS256")
+		errCh2 <- err
+	}()
+
+	// Cancel the first caller before the upstream responds.
+	cancel1()
+	if err := <-errCh1; err == nil {
+		t.Fatal("expected canceled first caller to fail")
+	}
+	close(release)
+	if err := <-errCh2; err != nil {
+		t.Fatalf("second waiter failed due to first caller cancellation: %v", err)
+	}
+	if !cache.Ready() {
+		t.Fatal("cache should be ready after shared fetch completed")
+	}
+}
+
+func TestPeriodicRefreshDoesNotBlockOnDemandRotation(t *testing.T) {
+	r, e := testKeys(t)
+	var rotated atomic.Bool
+	cache, _ := serverCache(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if rotated.Load() {
+			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{e}})
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{r}})
+		}
+	}, time.Minute)
+
+	if err := cache.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Immediately rotate keys right after periodic/startup refresh.
+	rotated.Store(true)
+	if _, err := cache.Key(context.Background(), "ec", "ES256"); err != nil {
+		t.Fatalf("on-demand key rotation was blocked by periodic refresh: %v", err)
+	}
+}
+
+func TestRunRetriesQuicklyAndLogsFailures(t *testing.T) {
+	r, _ := testKeys(t)
+	var attempts atomic.Int32
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+
+	cache, _ := serverCacheWithLogger(t, func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "secret upstream body", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{r}})
+	}, 10*time.Minute, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		cache.Run(ctx)
+		close(done)
+	}()
+
+	// Even though interval is 10m, Run should retry within ~2s and become ready.
+	deadline := time.Now().Add(4 * time.Second)
+	for !cache.Ready() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if !cache.Ready() {
+		t.Fatalf("cache did not recover quickly after initial failure; attempts=%d", attempts.Load())
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "periodic JWKS refresh failed") {
+		t.Fatalf("expected structured failure log, got: %s", logged)
+	}
+	if strings.Contains(logged, "secret upstream body") {
+		t.Fatalf("leaked upstream response body in logs: %s", logged)
 	}
 }

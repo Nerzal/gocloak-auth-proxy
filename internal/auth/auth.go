@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rsa"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -36,6 +37,7 @@ type roleClaims struct {
 
 type claims struct {
 	jwt.RegisteredClaims
+	Type           string                `json:"typ"`
 	Username       string                `json:"preferred_username"`
 	Email          string                `json:"email"`
 	Groups         []string              `json:"groups"`
@@ -71,7 +73,7 @@ func New(keys KeySource, issuer, audience string, skew time.Duration, requiredRe
 		parser: jwt.NewParser(
 			jwt.WithValidMethods([]string{"RS256", "ES256"}),
 			jwt.WithIssuer(issuer), jwt.WithAudience(audience),
-			jwt.WithExpirationRequired(), jwt.WithNotBeforeRequired(),
+			jwt.WithExpirationRequired(),
 			jwt.WithIssuedAt(), jwt.WithLeeway(skew), jwt.WithStrictDecoding(),
 		),
 		realmRoles:  append([]string(nil), requiredRealmRoles...),
@@ -97,7 +99,7 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Identity, 
 	token, err := v.parser.ParseWithClaims(raw, &c, func(t *jwt.Token) (any, error) {
 		return v.key(ctx, t)
 	})
-	if err != nil || token == nil || !token.Valid || c.IssuedAt == nil {
+	if err != nil || token == nil || !token.Valid || c.IssuedAt == nil || c.Type != "Bearer" {
 		return Identity{}, errInvalid
 	}
 	return v.identity(c)
@@ -131,9 +133,6 @@ func (v *Verifier) key(ctx context.Context, t *jwt.Token) (any, error) {
 		if !ok || k == nil || k.Curve != elliptic.P256() || k.X == nil || k.Y == nil {
 			return nil, errInvalid
 		}
-		if _, err := k.Bytes(); err != nil {
-			return nil, errInvalid
-		}
 	default:
 		return nil, errInvalid
 	}
@@ -144,6 +143,9 @@ func (v *Verifier) identity(c claims) (Identity, error) {
 	user := c.Username
 	if user == "" {
 		user = c.Subject
+	}
+	if strings.TrimSpace(user) == "" {
+		return Identity{}, errInvalid
 	}
 	var client []string
 	if v.clientID != "" {
@@ -160,6 +162,9 @@ func (v *Verifier) identity(c claims) (Identity, error) {
 }
 
 func safeHeaderValue(s string) bool {
+	if strings.TrimSpace(s) != s {
+		return false
+	}
 	for _, r := range s {
 		if unicode.IsControl(r) {
 			return false
@@ -170,7 +175,7 @@ func safeHeaderValue(s string) bool {
 
 func safeValues(values []string) bool {
 	for _, value := range values {
-		if !safeHeaderValue(value) {
+		if value == "" || !safeHeaderValue(value) {
 			return false
 		}
 	}
@@ -178,6 +183,17 @@ func safeValues(values []string) bool {
 }
 
 func hasRoles(actual, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	if len(actual) <= 16 || len(required) <= 4 {
+		for _, role := range required {
+			if !slices.Contains(actual, role) {
+				return false
+			}
+		}
+		return true
+	}
 	set := make(map[string]struct{}, len(actual))
 	for _, role := range actual {
 		set[role] = struct{}{}
@@ -190,10 +206,27 @@ func hasRoles(actual, required []string) bool {
 	return true
 }
 
-func uniqueRoles(groups ...[]string) []string {
-	var roles []string
-	seen := make(map[string]struct{})
-	for _, group := range groups {
+func uniqueRoles(realm, client []string) []string {
+	total := len(realm) + len(client)
+	if total == 0 {
+		return nil
+	}
+	roles := make([]string, 0, total)
+	if total <= 8 {
+		for _, role := range realm {
+			if !slices.Contains(roles, role) {
+				roles = append(roles, role)
+			}
+		}
+		for _, role := range client {
+			if !slices.Contains(roles, role) {
+				roles = append(roles, role)
+			}
+		}
+		return roles
+	}
+	seen := make(map[string]struct{}, total)
+	for _, group := range [2][]string{realm, client} {
 		for _, role := range group {
 			if _, ok := seen[role]; !ok {
 				seen[role] = struct{}{}

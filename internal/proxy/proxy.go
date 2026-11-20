@@ -3,10 +3,13 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -14,8 +17,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Nerzal/gocloak-auth-proxy/internal/auth"
+)
+
+const (
+	upstreamHeaderTimeout  = 15 * time.Second
+	upstreamRequestTimeout = 25 * time.Second
 )
 
 // Verifier authenticates the incoming Authorization header.
@@ -37,13 +46,55 @@ func (h HeaderNames) normalized() (HeaderNames, error) {
 		if *name == "" {
 			*name = defaults[i]
 		}
-		lower := strings.ToLower(*name)
-		if !validHeaderName(*name) || forbiddenHeader(lower) || seen[lower] {
+		norm := normalizeHeaderKey(*name)
+		if !validHeaderName(*name) || forbiddenHeader(norm) || seen[norm] {
 			return HeaderNames{}, fmt.Errorf("invalid or duplicate identity header %q", *name)
 		}
-		seen[lower] = true
+		seen[norm] = true
 	}
 	return h, nil
+}
+
+func normByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	if b == '_' {
+		return '-'
+	}
+	return b
+}
+
+func normalizeHeaderKey(s string) string {
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		b[i] = normByte(s[i])
+	}
+	return string(b)
+}
+
+func headerEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if normByte(a[i]) != normByte(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func headerHasPrefixFold(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		if normByte(s[i]) != normByte(prefix[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func validHeaderName(s string) bool {
@@ -64,7 +115,7 @@ func forbiddenHeader(name string) bool {
 		return true
 	}
 	switch name {
-	case "authorization", "proxy-authorization", "forwarded", "host", "connection", "proxy-connection",
+	case "authorization", "proxy-authorization", "forwarded", "x-real-ip", "host", "connection", "proxy-connection",
 		"keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "content-length",
 		"cookie", "set-cookie", "expect", "x-content-type-options", "x-frame-options", "referrer-policy":
 		return true
@@ -72,29 +123,31 @@ func forbiddenHeader(name string) bool {
 	return false
 }
 
-func scrubIdentity(headers http.Header, names HeaderNames) {
+// scrubHeaders removes client-provided identity headers, forwarding metadata,
+// and bearer credentials in a single pass, treating hyphens and underscores
+// equivalently to prevent WSGI/CGI-style header aliasing.
+func scrubHeaders(headers http.Header, names HeaderNames) {
 	for key := range headers {
-		if strings.HasPrefix(strings.ToLower(key), "x-auth-request-") ||
-			strings.EqualFold(key, names.User) || strings.EqualFold(key, names.Email) ||
-			strings.EqualFold(key, names.Groups) || strings.EqualFold(key, names.Roles) {
-			delete(headers, key)
-		}
-	}
-}
-
-// scrubUntrusted removes client-provided forwarding metadata and bearer credentials.
-func scrubUntrusted(headers http.Header) {
-	for key := range headers {
-		if strings.EqualFold(key, "Forwarded") || strings.HasPrefix(strings.ToLower(key), "x-forwarded-") ||
-			strings.EqualFold(key, "Authorization") {
+		if headerHasPrefixFold(key, "x-auth-request-") ||
+			headerHasPrefixFold(key, "x-forwarded-") ||
+			headerEqualFold(key, "forwarded") ||
+			headerEqualFold(key, "x-real-ip") ||
+			headerEqualFold(key, "authorization") ||
+			headerEqualFold(key, names.User) ||
+			headerEqualFold(key, names.Email) ||
+			headerEqualFold(key, names.Groups) ||
+			headerEqualFold(key, names.Roles) {
 			delete(headers, key)
 		}
 	}
 }
 
 func validValue(value string) bool {
-	for i := 0; i < len(value); i++ {
-		if value[i] < 32 || value[i] == 127 {
+	if strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
 			return false
 		}
 	}
@@ -102,21 +155,23 @@ func validValue(value string) bool {
 }
 
 func identityValues(identity auth.Identity) ([4]string, bool) {
-	values := [4]string{identity.User, identity.Email, strings.Join(identity.Groups, ","), strings.Join(identity.Roles, ",")}
-	for _, value := range values {
-		if !validValue(value) {
-			return values, false
-		}
+	if identity.User == "" || !validValue(identity.User) || !validValue(identity.Email) {
+		return [4]string{}, false
 	}
 	// Commas are the list separator and must not be interpreted as extra claims.
-	for _, list := range [][]string{identity.Groups, identity.Roles} {
+	for _, list := range [2][]string{identity.Groups, identity.Roles} {
 		for _, value := range list {
-			if strings.Contains(value, ",") {
-				return values, false
+			if value == "" || !validValue(value) || strings.Contains(value, ",") {
+				return [4]string{}, false
 			}
 		}
 	}
-	return values, true
+	return [4]string{
+		identity.User,
+		identity.Email,
+		strings.Join(identity.Groups, ","),
+		strings.Join(identity.Roles, ","),
+	}, true
 }
 
 func inject(headers http.Header, names HeaderNames, values [4]string) {
@@ -132,23 +187,31 @@ func securityHeaders(headers http.Header) {
 	headers.Set("Referrer-Policy", "no-referrer")
 }
 
+func writeUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+}
+
 func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, names HeaderNames) ([4]string, bool) {
 	securityHeaders(w.Header())
-	authorization := r.Header.Get("Authorization")
-	scrubIdentity(r.Header, names)
-	scrubUntrusted(r.Header)
-	identity, err := verifier.Verify(r.Context(), authorization)
+	authHeaders := r.Header.Values("Authorization")
+	scrubHeaders(r.Header, names)
+	if len(authHeaders) != 1 {
+		writeUnauthorized(w)
+		return [4]string{}, false
+	}
+	identity, err := verifier.Verify(r.Context(), authHeaders[0])
 	if err != nil {
 		if errors.Is(err, auth.ErrForbidden) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 		} else {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			writeUnauthorized(w)
 		}
 		return [4]string{}, false
 	}
 	values, ok := identityValues(identity)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		writeUnauthorized(w)
 		return [4]string{}, false
 	}
 	return values, true
@@ -164,6 +227,8 @@ func NewForwardAuth(verifier Verifier, headers HeaderNames) (http.Handler, error
 		return nil, err
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Add("Vary", "Authorization")
 		values, ok := authenticate(w, r, verifier, names)
 		if !ok {
 			return
@@ -189,8 +254,34 @@ func (p *bufferPool) Put(b []byte) {
 	}
 }
 
+func classifyProxyError(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "client_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "upstream_timeout"
+	}
+	var certErr x509.UnknownAuthorityError
+	var hostErr x509.HostnameError
+	var certInvalid x509.CertificateInvalidError
+	var tlsErr *tls.RecordHeaderError
+	if errors.As(err, &certErr) || errors.As(err, &hostErr) || errors.As(err, &certInvalid) || errors.As(err, &tlsErr) {
+		return "upstream_tls_error"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "upstream_timeout"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return "upstream_dial_error"
+	}
+	return "upstream_error"
+}
+
 // NewReverseProxy forwards authenticated requests only to the configured upstream.
-func NewReverseProxy(verifier Verifier, upstream string, headers HeaderNames) (http.Handler, error) {
+// A nil logger discards upstream diagnostics.
+func NewReverseProxy(verifier Verifier, upstream string, headers HeaderNames, logger *slog.Logger) (http.Handler, error) {
 	if verifier == nil {
 		return nil, errors.New("verifier is required")
 	}
@@ -203,16 +294,20 @@ func NewReverseProxy(verifier Verifier, upstream string, headers HeaderNames) (h
 		target.Host == "" || target.Hostname() == "" || target.User != nil || strings.Contains(upstream, "#") || target.Opaque != "" {
 		return nil, errors.New("upstream must be an absolute HTTP(S) URL without userinfo or fragment")
 	}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
+		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: upstreamHeaderTimeout,
 		ExpectContinueTimeout: time.Second,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 	type identityKey struct{}
 	reverse := &httputil.ReverseProxy{
@@ -221,8 +316,7 @@ func NewReverseProxy(verifier Verifier, upstream string, headers HeaderNames) (h
 		ErrorLog:   log.New(io.Discard, "", 0),
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.SetURL(target)
-			scrubIdentity(req.Out.Header, names)
-			scrubUntrusted(req.Out.Header)
+			scrubHeaders(req.Out.Header, names)
 			inject(req.Out.Header, names, req.In.Context().Value(identityKey{}).([4]string))
 		},
 		ModifyResponse: func(response *http.Response) error {
@@ -232,7 +326,8 @@ func NewReverseProxy(verifier Verifier, upstream string, headers HeaderNames) (h
 			response.Header.Del("Referrer-Policy")
 			return nil
 		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			logger.Warn("upstream request failed", "category", classifyProxyError(err))
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
 	}
@@ -241,6 +336,8 @@ func NewReverseProxy(verifier Verifier, upstream string, headers HeaderNames) (h
 		if !ok {
 			return
 		}
-		reverse.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, values)))
+		ctx, cancel := context.WithTimeout(r.Context(), upstreamRequestTimeout)
+		defer cancel()
+		reverse.ServeHTTP(w, r.WithContext(context.WithValue(ctx, identityKey{}, values)))
 	}), nil
 }
