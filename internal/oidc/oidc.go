@@ -27,7 +27,7 @@ import (
 
 	"github.com/Nerzal/gocloak-auth-proxy/internal/auth"
 	"github.com/Nerzal/gocloak-auth-proxy/internal/keycloak"
-	"github.com/Nerzal/gocloak/v14"
+	"github.com/Nerzal/gocloak/v15"
 	"github.com/golang-jwt/jwt/v5"
 )
 

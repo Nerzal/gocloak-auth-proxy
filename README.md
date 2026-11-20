@@ -1,6 +1,6 @@
 # gocloak-auth-proxy
 
-A security-first, high-performance Go authentication proxy built specifically for **Keycloak** using `github.com/Nerzal/gocloak/v14` and the Go standard library — with **minimal third-party dependencies** (enforced via `depguard`).
+A security-first, high-performance Go authentication proxy built specifically for **Keycloak** using `github.com/Nerzal/gocloak/v15` and the Go standard library — with **minimal third-party dependencies** (enforced via `depguard`).
 
 It supports **Forward-Auth** (Traefik / Nginx `auth_request`), **Reverse-Proxy**, and **Browser SSO (OIDC Authorization Code + PKCE)** out of the box.
 

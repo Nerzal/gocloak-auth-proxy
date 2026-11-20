@@ -23,7 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Nerzal/gocloak/v14"
+	"github.com/Nerzal/gocloak/v15"
 )
 
 const (
@@ -292,7 +292,7 @@ func parseKeys(rawKeys []gocloak.CertResponseKey) (map[string]signingKey, error)
 	keys := make(map[string]signingKey)
 	seen := make(map[string]struct{})
 	for _, raw := range rawKeys {
-		if kid := value(raw.Kid); kid != "" {
+		if kid := raw.Kid; kid != "" {
 			if _, exists := seen[kid]; exists {
 				return nil, errors.New("duplicate JWKS key ID")
 			}
@@ -380,30 +380,23 @@ func (t *boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-func value(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
-func decode(s *string, max int) ([]byte, bool) {
-	if s == nil || len(*s) == 0 || len(*s) > base64.RawURLEncoding.EncodedLen(max) {
+func decode(s string, max int) ([]byte, bool) {
+	if len(s) == 0 || len(s) > base64.RawURLEncoding.EncodedLen(max) {
 		return nil, false
 	}
-	b, err := base64.RawURLEncoding.Strict().DecodeString(*s)
+	b, err := base64.RawURLEncoding.Strict().DecodeString(s)
 	return b, err == nil && len(b) > 0 && len(b) <= max
 }
 
 func parseKey(raw gocloak.CertResponseKey) (string, signingKey, bool) {
-	kid, alg, use := value(raw.Kid), value(raw.Alg), value(raw.Use)
+	kid, alg, use := raw.Kid, raw.Alg, raw.Use
 	if kid == "" || len(kid) > 256 || (use != "" && use != "sig") {
 		return "", signingKey{}, false
 	}
 	if len(raw.KeyOps) > 0 && (len(raw.KeyOps) != 1 || raw.KeyOps[0] != "verify") {
 		return "", signingKey{}, false
 	}
-	switch value(raw.Kty) {
+	switch raw.Kty {
 	case "RSA":
 		if alg == "" {
 			alg = "RS256"
@@ -431,7 +424,7 @@ func parseKey(raw gocloak.CertResponseKey) (string, signingKey, bool) {
 		var curve elliptic.Curve
 		var coordSize int
 		var expectedAlg string
-		switch value(raw.Crv) {
+		switch raw.Crv {
 		case "P-256":
 			curve, coordSize, expectedAlg = elliptic.P256(), 32, "ES256"
 		case "P-384":
@@ -459,7 +452,7 @@ func parseKey(raw gocloak.CertResponseKey) (string, signingKey, bool) {
 		}
 		return kid, signingKey{expectedAlg, key}, true
 	case "OKP":
-		if value(raw.Crv) != "Ed25519" || (alg != "" && alg != "EdDSA") {
+		if raw.Crv != "Ed25519" || (alg != "" && alg != "EdDSA") {
 			break
 		}
 		x, ok := decode(raw.X, ed25519.PublicKeySize)
