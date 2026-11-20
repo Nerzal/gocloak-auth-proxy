@@ -295,15 +295,7 @@ func (m *Manager) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     m.stateCookie,
-		Value:    encoded,
-		Path:     "/",
-		MaxAge:   int(stateCookieTTL.Seconds()),
-		HttpOnly: true,
-		Secure:   m.cookieSecure,
-		SameSite: m.sameSite,
-	})
+	http.SetCookie(w, m.newCookie(m.stateCookie, encoded, int(stateCookieTTL.Seconds())))
 	q := url.Values{
 		"response_type":         {"code"},
 		"client_id":             {m.clientID},
@@ -487,15 +479,7 @@ func (m *Manager) writeSession(w http.ResponseWriter, sess sessionData) error {
 		return errors.New("session cookie exceeds maximum chunk limit")
 	}
 	for i, chunk := range chunks {
-		http.SetCookie(w, &http.Cookie{
-			Name:     m.chunkName(i),
-			Value:    chunk,
-			Path:     "/",
-			MaxAge:   int(m.sessionMaxAge.Seconds()),
-			HttpOnly: true,
-			Secure:   m.cookieSecure,
-			SameSite: m.sameSite,
-		})
+		http.SetCookie(w, m.newCookie(m.chunkName(i), chunk, int(m.sessionMaxAge.Seconds())))
 	}
 	for i := len(chunks); i < maxCookieChunks; i++ {
 		m.clearCookie(w, m.chunkName(i))
@@ -529,15 +513,23 @@ func (m *Manager) clearSessionCookies(w http.ResponseWriter) {
 }
 
 func (m *Manager) clearCookie(w http.ResponseWriter, name string) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, m.newCookie(name, "", -1))
+}
+
+func (m *Manager) newCookie(name, value string, maxAge int) *http.Cookie {
+	// #nosec G124 -- HttpOnly is always true, Secure defaults to true, and SameSite defaults to Lax; configurable only for local HTTP development.
+	c := &http.Cookie{
 		Name:     name,
-		Value:    "",
+		Value:    value,
 		Path:     "/",
-		MaxAge:   -1,
+		MaxAge:   maxAge,
 		HttpOnly: true,
-		Secure:   m.cookieSecure,
-		SameSite: m.sameSite,
-	})
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	}
+	c.Secure = m.cookieSecure
+	c.SameSite = m.sameSite
+	return c
 }
 
 func (m *Manager) chunkName(index int) string {

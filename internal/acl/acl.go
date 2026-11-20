@@ -113,7 +113,7 @@ func parseRule(raw string) (Rule, error) {
 		} else if c, ok := strings.CutPrefix(entry, "client:"); ok && strings.TrimSpace(c) != "" {
 			clientRoles = append(clientRoles, strings.TrimSpace(c))
 		} else {
-			return Rule{}, fmt.Errorf("role %q must be prefixed with realm: or client:", entry)
+			return Rule{}, fmt.Errorf("role %q must use a realm: or client: prefix", entry)
 		}
 	}
 	if len(realmRoles) == 0 && len(clientRoles) == 0 {

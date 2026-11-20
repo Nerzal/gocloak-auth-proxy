@@ -27,9 +27,8 @@ import (
 )
 
 func main() {
-	logger := logging.New(os.Stderr)
-	if err := run(logger); err != nil {
-		logger.Error("server stopped", "reason", err.Error())
+	if err := run(); err != nil {
+		logging.New(os.Stderr).Error("server stopped", "reason", err.Error())
 		os.Exit(1)
 	}
 }
@@ -179,15 +178,14 @@ func buildHandler(cfg config.Config, logger *slog.Logger, reg *metrics.Registry)
 	return mux, cache, nil
 }
 
-func run(logger *slog.Logger) error {
+func run() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
-	if leveled, err := logging.NewWithLevel(os.Stderr, cfg.LogLevel); err != nil {
+	logger, err := logging.NewWithLevel(os.Stderr, cfg.LogLevel)
+	if err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
-	} else {
-		logger = leveled
 	}
 
 	reg := metrics.New()
