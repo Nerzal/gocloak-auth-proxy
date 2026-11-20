@@ -35,15 +35,20 @@ type Config struct {
 	RequireAnyGroup      bool
 	RequiredScopes       []string
 	RequiredACR          []string
+	RequiredAMR          []string
 	RequireEmailVerified bool
 	RequiredAZP          string
 	RequiredOrganization string
 	JWKSRefreshInterval  time.Duration
 	ClockSkew            time.Duration
 
-	// TLS & Timeouts (Milestone 1)
+	// TLS & Timeouts (Milestone 1 + mTLS)
 	KeycloakCAFile          string
+	KeycloakClientCertFile  string
+	KeycloakClientKeyFile   string
 	UpstreamCAFile          string
+	UpstreamClientCertFile  string
+	UpstreamClientKeyFile   string
 	TLSCertFile             string
 	TLSKeyFile              string
 	ServerReadHeaderTimeout time.Duration
@@ -64,167 +69,190 @@ type Config struct {
 	AllowCORSPreflight    bool
 	RouteRules            []string
 
-	// OIDC Browser SSO (Milestone 3)
-	OIDCEnabled        bool
-	OIDCRedirectURL    string
-	OIDCPostLogoutURL  string
-	OIDCCookieSecret   string
-	OIDCCookieName     string
-	OIDCCookieSecure   bool
-	OIDCCookieSameSite http.SameSite
-	OIDCScopes         []string
-	OIDCSessionMaxAge  time.Duration
-	OIDCRedirectUnauth bool
+	// OIDC Browser SSO (Milestone 3 + Multi-Domain / Backchannel Logout)
+	OIDCEnabled                bool
+	OIDCRedirectURL            string
+	OIDCPostLogoutURL          string
+	OIDCCookieSecret           string
+	OIDCCookieName             string
+	OIDCCookieDomain           string
+	OIDCCookieSecure           bool
+	OIDCCookieSameSite         http.SameSite
+	OIDCScopes                 []string
+	OIDCSessionMaxAge          time.Duration
+	OIDCRedirectUnauth         bool
+	OIDCAllowedRedirectDomains []string
 }
 
 func Load() (Config, error) {
 	c := Config{
-		Issuer:               os.Getenv("ISSUER"),
-		Audience:             os.Getenv("AUDIENCE"),
-		UpstreamURL:          os.Getenv("UPSTREAM_URL"),
-		ListenAddr:           envDefault("LISTEN_ADDR", ":8080"),
-		MetricsAddr:          os.Getenv("METRICS_ADDR"),
-		LogLevel:             envDefault("LOG_LEVEL", "info"),
-		ClientID:             os.Getenv("CLIENT_ID"),
-		ClientSecret:         os.Getenv("CLIENT_SECRET"),
-		HeaderUser:           os.Getenv("HEADER_USER"),
-		HeaderEmail:          os.Getenv("HEADER_EMAIL"),
-		HeaderGroups:         os.Getenv("HEADER_GROUPS"),
-		HeaderRoles:          os.Getenv("HEADER_ROLES"),
-		AllowedAlgorithms:    csvList(os.Getenv("ALLOWED_ALGORITHMS")),
-		RequiredRealmRoles:   csvList(os.Getenv("REQUIRED_REALM_ROLES")),
-		RequiredClientRoles:  csvList(os.Getenv("REQUIRED_CLIENT_ROLES")),
-		RequiredGroups:       csvList(os.Getenv("REQUIRED_GROUPS")),
-		RequiredScopes:       csvList(os.Getenv("REQUIRED_SCOPES")),
-		RequiredACR:          csvList(os.Getenv("REQUIRED_ACR")),
-		RequiredAZP:          os.Getenv("REQUIRED_AZP"),
-		RequiredOrganization: os.Getenv("REQUIRED_ORGANIZATION"),
-		KeycloakCAFile:       os.Getenv("KEYCLOAK_CA_FILE"),
-		UpstreamCAFile:       os.Getenv("UPSTREAM_CA_FILE"),
-		TLSCertFile:          os.Getenv("TLS_CERT_FILE"),
-		TLSKeyFile:           os.Getenv("TLS_KEY_FILE"),
-		PublicPaths:          csvList(os.Getenv("PUBLIC_PATHS")),
-		OptionalAuthPaths:    csvList(os.Getenv("OPTIONAL_AUTH_PATHS")),
-		RouteRules:           semiList(os.Getenv("ROUTE_RULES")),
-		OIDCRedirectURL:      os.Getenv("OIDC_REDIRECT_URL"),
-		OIDCPostLogoutURL:    envDefault("OIDC_POST_LOGOUT_URL", "/"),
-		OIDCCookieSecret:     os.Getenv("OIDC_COOKIE_SECRET"),
-		OIDCCookieName:       os.Getenv("OIDC_COOKIE_NAME"),
-		OIDCScopes:           csvList(os.Getenv("OIDC_SCOPES")),
+		ListenAddr:              ":8080",
+		LogLevel:                "info",
+		JWKSRefreshInterval:     5 * time.Minute,
+		ClockSkew:               30 * time.Second,
+		ServerReadHeaderTimeout: 5 * time.Second,
+		ServerReadTimeout:       15 * time.Second,
+		ServerWriteTimeout:      30 * time.Second,
+		ServerIdleTimeout:       60 * time.Second,
+		UpstreamHeaderTimeout:   15 * time.Second,
+		UpstreamRequestTimeout:  25 * time.Second,
+		IntrospectionCacheTTL:   15 * time.Second,
+		OIDCPostLogoutURL:       "/",
+		OIDCCookieSecure:        true,
+		OIDCCookieSameSite:      http.SameSiteLaxMode,
+		OIDCSessionMaxAge:       24 * time.Hour,
+		OIDCRedirectUnauth:      true,
 	}
-	var err error
-	if c.CustomClaimHeaders, err = parseMapping(os.Getenv("CUSTOM_CLAIM_HEADERS")); err != nil {
-		return Config{}, err
-	}
-	if c.RequireAnyRole, err = parseMatchMode("ROLE_MATCH_MODE"); err != nil {
-		return Config{}, err
-	}
-	if c.RequireAnyGroup, err = parseMatchMode("GROUP_MATCH_MODE"); err != nil {
-		return Config{}, err
-	}
-	if c.PassAccessToken, err = envBool("PASS_ACCESS_TOKEN", false); err != nil {
-		return Config{}, err
-	}
-	if c.RequireEmailVerified, err = envBool("REQUIRE_EMAIL_VERIFIED", false); err != nil {
-		return Config{}, err
-	}
-	if c.IntrospectionEnabled, err = envBool("INTROSPECTION_ENABLED", false); err != nil {
-		return Config{}, err
-	}
-	if c.UMAEnabled, err = envBool("UMA_ENABLED", false); err != nil {
-		return Config{}, err
-	}
-	if c.UMAMethodScope, err = envBool("UMA_METHOD_SCOPE", false); err != nil {
-		return Config{}, err
-	}
-	if c.AllowCORSPreflight, err = envBool("ALLOW_CORS_PREFLIGHT", false); err != nil {
-		return Config{}, err
-	}
-	if c.OIDCEnabled, err = envBool("OIDC_ENABLED", false); err != nil {
-		return Config{}, err
-	}
-	if c.OIDCCookieSecure, err = envBool("OIDC_COOKIE_SECURE", true); err != nil {
-		return Config{}, err
-	}
-	if c.OIDCRedirectUnauth, err = envBool("OIDC_REDIRECT", true); err != nil {
-		return Config{}, err
-	}
-	if c.OIDCCookieSameSite, err = parseSameSite(os.Getenv("OIDC_COOKIE_SAMESITE")); err != nil {
-		return Config{}, err
-	}
-	if c.JWKSRefreshInterval, err = duration("JWKS_REFRESH_INTERVAL", 5*time.Minute); err != nil {
-		return Config{}, err
-	}
-	if c.ClockSkew, err = duration("CLOCK_SKEW", 30*time.Second); err != nil {
-		return Config{}, err
-	}
-	if c.ServerReadHeaderTimeout, err = duration("SERVER_READ_HEADER_TIMEOUT", 5*time.Second); err != nil {
-		return Config{}, err
-	}
-	if c.ServerReadTimeout, err = duration("SERVER_READ_TIMEOUT", 15*time.Second); err != nil {
-		return Config{}, err
-	}
-	if c.ServerWriteTimeout, err = duration("SERVER_WRITE_TIMEOUT", 30*time.Second); err != nil {
-		return Config{}, err
-	}
-	if c.ServerIdleTimeout, err = duration("SERVER_IDLE_TIMEOUT", 60*time.Second); err != nil {
-		return Config{}, err
-	}
-	if c.UpstreamHeaderTimeout, err = duration("UPSTREAM_HEADER_TIMEOUT", 15*time.Second); err != nil {
-		return Config{}, err
-	}
-	if os.Getenv("UPSTREAM_REQUEST_TIMEOUT") != "" {
-		v, err := duration("UPSTREAM_REQUEST_TIMEOUT", 25*time.Second)
-		if err != nil {
+	if path := strings.TrimSpace(os.Getenv("CONFIG_FILE")); path != "" {
+		if err := applyConfigFile(path, &c); err != nil {
 			return Config{}, err
 		}
-		c.UpstreamRequestTimeout = v
-		if v == 0 {
-			c.DisableUpstreamTimeout = true
+	}
+
+	overrideStr := func(dst *string, envName string) {
+		if v := os.Getenv(envName); v != "" {
+			*dst = v
 		}
-	} else {
-		c.UpstreamRequestTimeout = 25 * time.Second
 	}
-	if c.IntrospectionCacheTTL, err = duration("INTROSPECTION_CACHE_TTL", 15*time.Second); err != nil {
-		return Config{}, err
+	overrideCSV := func(dst *[]string, envName string) {
+		if v := os.Getenv(envName); v != "" {
+			*dst = csvList(v)
+		}
 	}
-	if c.OIDCSessionMaxAge, err = duration("OIDC_SESSION_MAX_AGE", 24*time.Hour); err != nil {
-		return Config{}, err
+	overrideBool := func(dst *bool, envName string) error {
+		v := strings.TrimSpace(os.Getenv(envName))
+		if v == "" {
+			return nil
+		}
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid %s", envName)
+		}
+		*dst = b
+		return nil
+	}
+	overrideDur := func(dst *time.Duration, envName string) error {
+		v := os.Getenv(envName)
+		if v == "" {
+			return nil
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid %s", envName)
+		}
+		*dst = d
+		return nil
+	}
+
+	overrideStr(&c.Issuer, "ISSUER")
+	overrideStr(&c.Audience, "AUDIENCE")
+	overrideStr(&c.UpstreamURL, "UPSTREAM_URL")
+	overrideStr(&c.ListenAddr, "LISTEN_ADDR")
+	overrideStr(&c.MetricsAddr, "METRICS_ADDR")
+	overrideStr(&c.LogLevel, "LOG_LEVEL")
+	overrideStr(&c.ClientID, "CLIENT_ID")
+	overrideStr(&c.ClientSecret, "CLIENT_SECRET")
+	overrideStr(&c.HeaderUser, "HEADER_USER")
+	overrideStr(&c.HeaderEmail, "HEADER_EMAIL")
+	overrideStr(&c.HeaderGroups, "HEADER_GROUPS")
+	overrideStr(&c.HeaderRoles, "HEADER_ROLES")
+	overrideCSV(&c.AllowedAlgorithms, "ALLOWED_ALGORITHMS")
+	overrideCSV(&c.RequiredRealmRoles, "REQUIRED_REALM_ROLES")
+	overrideCSV(&c.RequiredClientRoles, "REQUIRED_CLIENT_ROLES")
+	overrideCSV(&c.RequiredGroups, "REQUIRED_GROUPS")
+	overrideCSV(&c.RequiredScopes, "REQUIRED_SCOPES")
+	overrideCSV(&c.RequiredACR, "REQUIRED_ACR")
+	overrideCSV(&c.RequiredAMR, "REQUIRED_AMR")
+	overrideStr(&c.RequiredAZP, "REQUIRED_AZP")
+	overrideStr(&c.RequiredOrganization, "REQUIRED_ORGANIZATION")
+	overrideStr(&c.KeycloakCAFile, "KEYCLOAK_CA_FILE")
+	overrideStr(&c.KeycloakClientCertFile, "KEYCLOAK_CLIENT_CERT_FILE")
+	overrideStr(&c.KeycloakClientKeyFile, "KEYCLOAK_CLIENT_KEY_FILE")
+	overrideStr(&c.UpstreamCAFile, "UPSTREAM_CA_FILE")
+	overrideStr(&c.UpstreamClientCertFile, "UPSTREAM_CLIENT_CERT_FILE")
+	overrideStr(&c.UpstreamClientKeyFile, "UPSTREAM_CLIENT_KEY_FILE")
+	overrideStr(&c.TLSCertFile, "TLS_CERT_FILE")
+	overrideStr(&c.TLSKeyFile, "TLS_KEY_FILE")
+	overrideCSV(&c.PublicPaths, "PUBLIC_PATHS")
+	overrideCSV(&c.OptionalAuthPaths, "OPTIONAL_AUTH_PATHS")
+	if v := os.Getenv("ROUTE_RULES"); v != "" {
+		c.RouteRules = semiList(v)
+	}
+	overrideStr(&c.OIDCRedirectURL, "OIDC_REDIRECT_URL")
+	overrideStr(&c.OIDCPostLogoutURL, "OIDC_POST_LOGOUT_URL")
+	overrideStr(&c.OIDCCookieSecret, "OIDC_COOKIE_SECRET")
+	overrideStr(&c.OIDCCookieName, "OIDC_COOKIE_NAME")
+	overrideStr(&c.OIDCCookieDomain, "OIDC_COOKIE_DOMAIN")
+	overrideCSV(&c.OIDCScopes, "OIDC_SCOPES")
+	overrideCSV(&c.OIDCAllowedRedirectDomains, "OIDC_ALLOWED_REDIRECT_DOMAINS")
+
+	var err error
+	if v := os.Getenv("CUSTOM_CLAIM_HEADERS"); v != "" {
+		if c.CustomClaimHeaders, err = parseMapping(v); err != nil {
+			return Config{}, err
+		}
+	}
+	if os.Getenv("ROLE_MATCH_MODE") != "" {
+		if c.RequireAnyRole, err = parseMatchMode("ROLE_MATCH_MODE"); err != nil {
+			return Config{}, err
+		}
+	}
+	if os.Getenv("GROUP_MATCH_MODE") != "" {
+		if c.RequireAnyGroup, err = parseMatchMode("GROUP_MATCH_MODE"); err != nil {
+			return Config{}, err
+		}
+	}
+	for _, item := range []struct {
+		dst *bool
+		env string
+	}{
+		{&c.PassAccessToken, "PASS_ACCESS_TOKEN"},
+		{&c.RequireEmailVerified, "REQUIRE_EMAIL_VERIFIED"},
+		{&c.IntrospectionEnabled, "INTROSPECTION_ENABLED"},
+		{&c.UMAEnabled, "UMA_ENABLED"},
+		{&c.UMAMethodScope, "UMA_METHOD_SCOPE"},
+		{&c.AllowCORSPreflight, "ALLOW_CORS_PREFLIGHT"},
+		{&c.OIDCEnabled, "OIDC_ENABLED"},
+		{&c.OIDCCookieSecure, "OIDC_COOKIE_SECURE"},
+		{&c.OIDCRedirectUnauth, "OIDC_REDIRECT"},
+	} {
+		if err = overrideBool(item.dst, item.env); err != nil {
+			return Config{}, err
+		}
+	}
+	if v := os.Getenv("OIDC_COOKIE_SAMESITE"); v != "" {
+		if c.OIDCCookieSameSite, err = parseSameSite(v); err != nil {
+			return Config{}, err
+		}
+	}
+	for _, item := range []struct {
+		dst *time.Duration
+		env string
+	}{
+		{&c.JWKSRefreshInterval, "JWKS_REFRESH_INTERVAL"},
+		{&c.ClockSkew, "CLOCK_SKEW"},
+		{&c.ServerReadHeaderTimeout, "SERVER_READ_HEADER_TIMEOUT"},
+		{&c.ServerReadTimeout, "SERVER_READ_TIMEOUT"},
+		{&c.ServerWriteTimeout, "SERVER_WRITE_TIMEOUT"},
+		{&c.ServerIdleTimeout, "SERVER_IDLE_TIMEOUT"},
+		{&c.UpstreamHeaderTimeout, "UPSTREAM_HEADER_TIMEOUT"},
+		{&c.IntrospectionCacheTTL, "INTROSPECTION_CACHE_TTL"},
+		{&c.OIDCSessionMaxAge, "OIDC_SESSION_MAX_AGE"},
+	} {
+		if err = overrideDur(item.dst, item.env); err != nil {
+			return Config{}, err
+		}
+	}
+	if os.Getenv("UPSTREAM_REQUEST_TIMEOUT") != "" {
+		if err = overrideDur(&c.UpstreamRequestTimeout, "UPSTREAM_REQUEST_TIMEOUT"); err != nil {
+			return Config{}, err
+		}
+		c.DisableUpstreamTimeout = (c.UpstreamRequestTimeout == 0)
 	}
 	if err = c.Validate(); err != nil {
 		return Config{}, err
 	}
 	return c, nil
-}
-
-func envDefault(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envBool(name string, fallback bool) (bool, error) {
-	v := strings.TrimSpace(os.Getenv(name))
-	if v == "" {
-		return fallback, nil
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return false, fmt.Errorf("invalid %s", name)
-	}
-	return b, nil
-}
-
-func duration(name string, fallback time.Duration) (time.Duration, error) {
-	if value := os.Getenv(name); value != "" {
-		v, err := time.ParseDuration(value)
-		if err != nil {
-			return 0, fmt.Errorf("invalid %s", name)
-		}
-		return v, nil
-	}
-	return fallback, nil
 }
 
 func csvList(value string) []string {
@@ -273,14 +301,7 @@ func parseMapping(value string) (map[string]string, error) {
 }
 
 func parseMatchMode(name string) (bool, error) {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
-	case "", "all":
-		return false, nil
-	case "any":
-		return true, nil
-	default:
-		return false, fmt.Errorf("%s must be 'all' or 'any'", name)
-	}
+	return parseMatchModeValue(name, os.Getenv(name))
 }
 
 func parseSameSite(value string) (http.SameSite, error) {
@@ -318,6 +339,12 @@ func (c Config) Validate() error {
 	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		return errors.New("TLS_CERT_FILE and TLS_KEY_FILE must both be set")
+	}
+	if (c.KeycloakClientCertFile == "") != (c.KeycloakClientKeyFile == "") {
+		return errors.New("KEYCLOAK_CLIENT_CERT_FILE and KEYCLOAK_CLIENT_KEY_FILE must both be set")
+	}
+	if (c.UpstreamClientCertFile == "") != (c.UpstreamClientKeyFile == "") {
+		return errors.New("UPSTREAM_CLIENT_CERT_FILE and UPSTREAM_CLIENT_KEY_FILE must both be set")
 	}
 	if c.JWKSRefreshInterval < time.Second || c.JWKSRefreshInterval > 12*time.Hour {
 		return errors.New("JWKS_REFRESH_INTERVAL must be between 1s and 12h")
@@ -363,10 +390,10 @@ func (c Config) Validate() error {
 	if c.UpstreamURL == "" && (c.UMAEnabled || len(c.RouteRules) > 0) {
 		return errors.New("UMA_ENABLED and ROUTE_RULES require UPSTREAM_URL (reverse-proxy mode)")
 	}
-	for _, list := range [][]string{c.RequiredRealmRoles, c.RequiredClientRoles, c.RequiredGroups, c.RequiredScopes, c.RequiredACR} {
+	for _, list := range [][]string{c.RequiredRealmRoles, c.RequiredClientRoles, c.RequiredGroups, c.RequiredScopes, c.RequiredACR, c.RequiredAMR} {
 		for _, item := range list {
 			if item == "" {
-				return errors.New("role, group, scope, and ACR names must not be empty")
+				return errors.New("role, group, scope, ACR, and AMR names must not be empty")
 			}
 		}
 	}

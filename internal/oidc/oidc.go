@@ -28,6 +28,7 @@ import (
 	"github.com/Nerzal/gocloak-auth-proxy/internal/auth"
 	"github.com/Nerzal/gocloak-auth-proxy/internal/keycloak"
 	"github.com/Nerzal/gocloak/v14"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 const (
@@ -62,12 +63,17 @@ type Config struct {
 	RedirectURL             string // e.g. https://app.example.com/oauth2/callback
 	PostLogoutURL           string // optional; defaults to "/"
 	CookieSecret            string // minimum 32 bytes
-	CookieName              string // optional; defaults to __Host-gocloak_session (or gocloak_session if !CookieSecure)
+	CookieName              string // optional; defaults to __Host-gocloak_session (or gocloak_session if !CookieSecure or CookieDomain != "")
+	CookieDomain            string // optional; e.g. .example.com for multi-subdomain SSO (incompatible with __Host- prefix)
 	CookieSecure            bool
 	CookieSameSite          http.SameSite // defaults to http.SameSiteLaxMode
 	Scopes                  []string      // defaults to ["openid", "profile", "email"]
 	SessionMaxAge           time.Duration // defaults to 24h
 	RedirectUnauthenticated bool
+	AllowedRedirectDomains  []string       // optional; e.g. app1.example.com, .example.com
+	Keys                    auth.KeySource // optional; enables POST /oauth2/backchannel-logout
+	AllowedAlgorithms       []string       // optional; defaults to ["RS256", "ES256"] for logout tokens
+	ClockSkew               time.Duration  // optional; defaults to 30s
 	TLSConfig               *tls.Config
 	Logger                  *slog.Logger
 	OnEvent                 func(event string)
@@ -85,6 +91,9 @@ type sessionData struct {
 	AccessToken      string `json:"a"`
 	RefreshToken     string `json:"r,omitempty"`
 	IDToken          string `json:"i,omitempty"`
+	SID              string `json:"sid,omitempty"`
+	Sub              string `json:"sub,omitempty"`
+	IssuedAt         int64  `json:"iat,omitempty"`
 	ExpiresAt        int64  `json:"e"`
 	SessionExpiresAt int64  `json:"se"`
 }
@@ -102,29 +111,37 @@ type refreshCacheEntry struct {
 
 // Manager handles OIDC browser login, callback, logout, and session cookie resolution.
 type Manager struct {
-	issuer         string
-	realm          string
-	clientID       string
-	clientSecret   string
-	redirectURL    string
-	postLogoutURL  string
-	scopes         string
-	cookieName     string
-	stateCookie    string
-	cookieSecure   bool
-	sameSite       http.SameSite
-	sessionMaxAge  time.Duration
-	redirectUnauth bool
-	aead           cipher.AEAD
-	httpClient     *http.Client
-	kcClient       *gocloak.GoCloak
-	verifier       TokenVerifier
-	logger         *slog.Logger
-	onEvent        func(string)
+	issuer                 string
+	realm                  string
+	clientID               string
+	clientSecret           string
+	redirectURL            string
+	postLogoutURL          string
+	scopes                 string
+	cookieName             string
+	stateCookie            string
+	cookieDomain           string
+	cookieSecure           bool
+	sameSite               http.SameSite
+	sessionMaxAge          time.Duration
+	redirectUnauth         bool
+	allowedRedirectDomains []string
+	aead                   cipher.AEAD
+	httpClient             *http.Client
+	kcClient               *gocloak.GoCloak
+	verifier               TokenVerifier
+	keys                   auth.KeySource
+	logoutParser           *jwt.Parser
+	logger                 *slog.Logger
+	onEvent                func(string)
 
 	refreshMu      sync.Mutex
 	refreshFlights map[[32]byte]*refreshFlight
 	refreshCache   map[[32]byte]refreshCacheEntry
+
+	revokeMu    sync.RWMutex
+	revokedSIDs map[string]time.Time
+	revokedSubs map[string]time.Time
 }
 
 // New constructs a validated OIDC browser SSO manager.
@@ -146,16 +163,20 @@ func New(cfg Config, verifier TokenVerifier) (*Manager, error) {
 	if err != nil || ru == nil || (ru.Scheme != "http" && ru.Scheme != "https") || ru.Host == "" || ru.User != nil || ru.Fragment != "" {
 		return nil, errors.New("OIDC_REDIRECT_URL must be an absolute HTTP(S) URL")
 	}
+	cookieDomain := strings.ToLower(strings.TrimSpace(cfg.CookieDomain))
+	if cookieDomain != "" && strings.ContainsAny(cookieDomain, " \t\r\n/\\:;@") {
+		return nil, errors.New("invalid OIDC_COOKIE_DOMAIN")
+	}
 	cookieName := strings.TrimSpace(cfg.CookieName)
 	if cookieName == "" {
-		if cfg.CookieSecure {
+		if cfg.CookieSecure && cookieDomain == "" {
 			cookieName = defaultCookieName
 		} else {
 			cookieName = "gocloak_session"
 		}
 	}
-	if strings.HasPrefix(cookieName, "__Host-") && !cfg.CookieSecure {
-		return nil, errors.New("__Host- cookie prefix requires OIDC_COOKIE_SECURE=true")
+	if strings.HasPrefix(cookieName, "__Host-") && (!cfg.CookieSecure || cookieDomain != "") {
+		return nil, errors.New("__Host- cookie prefix requires OIDC_COOKIE_SECURE=true and empty OIDC_COOKIE_DOMAIN")
 	}
 	sameSite := cfg.CookieSameSite
 	if sameSite == 0 {
@@ -171,6 +192,10 @@ func New(cfg Config, verifier TokenVerifier) (*Manager, error) {
 	scopes := cfg.Scopes
 	if len(scopes) == 0 {
 		scopes = []string{"openid", "profile", "email"}
+	}
+	allowedDomains, err := normalizeAllowedDomains(cfg.AllowedRedirectDomains)
+	if err != nil {
+		return nil, err
 	}
 	key := sha256.Sum256([]byte(cfg.CookieSecret))
 	block, err := aes.NewCipher(key[:])
@@ -202,36 +227,66 @@ func New(cfg Config, verifier TokenVerifier) (*Manager, error) {
 	if postLogout == "" {
 		postLogout = "/"
 	}
+	issuer := strings.TrimRight(cfg.Issuer, "/")
+	var logoutParser *jwt.Parser
+	if cfg.Keys != nil {
+		algs := cfg.AllowedAlgorithms
+		if len(algs) == 0 {
+			algs = []string{"RS256", "ES256"}
+		}
+		skew := cfg.ClockSkew
+		if skew <= 0 {
+			skew = 30 * time.Second
+		}
+		logoutParser = jwt.NewParser(
+			jwt.WithValidMethods(algs),
+			jwt.WithIssuer(issuer),
+			jwt.WithAudience(cfg.ClientID),
+			jwt.WithIssuedAt(),
+			jwt.WithLeeway(skew),
+			jwt.WithStrictDecoding(),
+		)
+	}
 	return &Manager{
-		issuer:         strings.TrimRight(cfg.Issuer, "/"),
-		realm:          realm,
-		clientID:       cfg.ClientID,
-		clientSecret:   cfg.ClientSecret,
-		redirectURL:    cfg.RedirectURL,
-		postLogoutURL:  postLogout,
-		scopes:         strings.Join(scopes, " "),
-		cookieName:     cookieName,
-		stateCookie:    cookieName + stateCookieSuffix,
-		cookieSecure:   cfg.CookieSecure,
-		sameSite:       sameSite,
-		sessionMaxAge:  sessionMaxAge,
-		redirectUnauth: cfg.RedirectUnauthenticated,
-		aead:           aead,
-		httpClient:     httpClient,
-		kcClient:       kcClient,
-		verifier:       verifier,
-		logger:         logger,
-		onEvent:        cfg.OnEvent,
-		refreshFlights: make(map[[32]byte]*refreshFlight),
-		refreshCache:   make(map[[32]byte]refreshCacheEntry),
+		issuer:                 issuer,
+		realm:                  realm,
+		clientID:               cfg.ClientID,
+		clientSecret:           cfg.ClientSecret,
+		redirectURL:            cfg.RedirectURL,
+		postLogoutURL:          postLogout,
+		scopes:                 strings.Join(scopes, " "),
+		cookieName:             cookieName,
+		stateCookie:            cookieName + stateCookieSuffix,
+		cookieDomain:           cookieDomain,
+		cookieSecure:           cfg.CookieSecure,
+		sameSite:               sameSite,
+		sessionMaxAge:          sessionMaxAge,
+		redirectUnauth:         cfg.RedirectUnauthenticated,
+		allowedRedirectDomains: allowedDomains,
+		aead:                   aead,
+		httpClient:             httpClient,
+		kcClient:               kcClient,
+		verifier:               verifier,
+		keys:                   cfg.Keys,
+		logoutParser:           logoutParser,
+		logger:                 logger,
+		onEvent:                cfg.OnEvent,
+		refreshFlights:         make(map[[32]byte]*refreshFlight),
+		refreshCache:           make(map[[32]byte]refreshCacheEntry),
+		revokedSIDs:            make(map[string]time.Time),
+		revokedSubs:            make(map[string]time.Time),
 	}, nil
 }
 
-// RegisterRoutes mounts /oauth2/start, /oauth2/callback, and /oauth2/logout on mux.
+// RegisterRoutes mounts /oauth2/start, /oauth2/callback, /oauth2/logout, and
+// (when Keys is configured) /oauth2/backchannel-logout on mux.
 func (m *Manager) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/oauth2/start", m.handleStart)
 	mux.HandleFunc("/oauth2/callback", m.handleCallback)
 	mux.HandleFunc("/oauth2/logout", m.handleLogout)
+	if m.keys != nil {
+		mux.HandleFunc("/oauth2/backchannel-logout", m.handleBackchannelLogout)
+	}
 }
 
 // StripCookies removes the proxy's own OIDC session and state cookies from
@@ -299,7 +354,7 @@ func (m *Manager) ShouldRedirect(r *http.Request) bool {
 
 // RedirectToLogin sends a 302 Found redirect to /oauth2/start with a safe rd target.
 func (m *Manager) RedirectToLogin(w http.ResponseWriter, r *http.Request) {
-	rd := safeRedirectPath(r.URL.RequestURI())
+	rd := m.redirectTargetForRequest(r)
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, "/oauth2/start?rd="+url.QueryEscape(rd), http.StatusFound)
 }
@@ -313,6 +368,10 @@ func (m *Manager) ResolveBearer(w http.ResponseWriter, r *http.Request) (string,
 	}
 	sess, ok := m.readSession(r)
 	if !ok || sess.AccessToken == "" {
+		return "", false
+	}
+	if m.isRevoked(sess.SID, sess.Sub, sess.IssuedAt) {
+		m.clearSessionCookies(w)
 		return "", false
 	}
 	if sess.ExpiresAt > 0 && time.Now().Add(refreshEarlyMargin).Unix() >= sess.ExpiresAt && sess.RefreshToken != "" {
@@ -408,7 +467,7 @@ func (m *Manager) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	challengeSum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(challengeSum[:])
-	rd := safeRedirectPath(r.URL.Query().Get("rd"))
+	rd := m.safeRedirectURL(r.URL.Query().Get("rd"))
 
 	st := authState{
 		State:        state,
@@ -475,7 +534,8 @@ func (m *Manager) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if _, err := m.verifier.Verify(r.Context(), "Bearer "+sess.AccessToken); err != nil {
+	id, err := m.verifier.Verify(r.Context(), "Bearer "+sess.AccessToken)
+	if err != nil {
 		m.record("error")
 		if errors.Is(err, auth.ErrForbidden) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
@@ -484,13 +544,16 @@ func (m *Manager) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	sess.SID = id.SID
+	sess.Sub = id.Subject
+	sess.IssuedAt = time.Now().Unix()
 	if err := m.writeSession(w, sess); err != nil {
 		m.record("error")
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	m.record("success")
-	http.Redirect(w, r, safeRedirectPath(st.Redirect), http.StatusFound)
+	http.Redirect(w, r, m.safeRedirectURL(st.Redirect), http.StatusFound)
 }
 
 func (m *Manager) verifyIDToken(idToken, expectedNonce string) bool {
@@ -656,6 +719,9 @@ func (m *Manager) refresh(ctx context.Context, prev sessionData) (sessionData, e
 		AccessToken:      jwtResp.AccessToken,
 		RefreshToken:     refreshTok,
 		IDToken:          idTok,
+		SID:              prev.SID,
+		Sub:              prev.Sub,
+		IssuedAt:         prev.IssuedAt,
 		ExpiresAt:        exp,
 		SessionExpiresAt: prev.SessionExpiresAt,
 	}, nil
@@ -729,6 +795,7 @@ func (m *Manager) newCookie(name, value string, maxAge int) *http.Cookie {
 		Name:     name,
 		Value:    value,
 		Path:     "/",
+		Domain:   m.cookieDomain,
 		MaxAge:   maxAge,
 		HttpOnly: true,
 		Secure:   true,

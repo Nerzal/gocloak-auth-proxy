@@ -21,13 +21,15 @@ const (
 	ModeOptional
 )
 
-// Rule defines method- and path-scoped role requirements.
-// Syntax: [METHOD:]/path/pattern=realm:role1,client:role2
+// Rule defines method- and path-scoped role and step-up auth requirements.
+// Syntax: [METHOD:]/path/pattern=realm:role1,client:role2,acr:aal2,amr:mfa
 type Rule struct {
 	Method      string // empty or "*" matches any method
 	Pattern     string // exact path or prefix ending in "/*"
 	RealmRoles  []string
 	ClientRoles []string
+	ACR         []string
+	AMR         []string
 }
 
 // Policy evaluates incoming requests against public, optional, and role rules.
@@ -102,28 +104,51 @@ func parseRule(raw string) (Rule, error) {
 	if strings.Contains(pattern, "..") || strings.ContainsAny(pattern, " \t\r\n") {
 		return Rule{}, fmt.Errorf("invalid route rule pattern %q", pattern)
 	}
-	var realmRoles, clientRoles []string
+	var realmRoles, clientRoles, acrs, amrs []string
 	for _, entry := range strings.Split(rhs, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
-			return Rule{}, fmt.Errorf("empty role in route rule %q", raw)
+			return Rule{}, fmt.Errorf("empty requirement in route rule %q", raw)
 		}
-		if r, ok := strings.CutPrefix(entry, "realm:"); ok && strings.TrimSpace(r) != "" {
-			realmRoles = append(realmRoles, strings.TrimSpace(r))
-		} else if c, ok := strings.CutPrefix(entry, "client:"); ok && strings.TrimSpace(c) != "" {
-			clientRoles = append(clientRoles, strings.TrimSpace(c))
-		} else {
-			return Rule{}, fmt.Errorf("role %q must use a realm: or client: prefix", entry)
+		switch {
+		case strings.HasPrefix(entry, "realm:"):
+			r := strings.TrimSpace(strings.TrimPrefix(entry, "realm:"))
+			if r == "" {
+				return Rule{}, fmt.Errorf("empty realm role in route rule %q", raw)
+			}
+			realmRoles = append(realmRoles, r)
+		case strings.HasPrefix(entry, "client:"):
+			c := strings.TrimSpace(strings.TrimPrefix(entry, "client:"))
+			if c == "" {
+				return Rule{}, fmt.Errorf("empty client role in route rule %q", raw)
+			}
+			clientRoles = append(clientRoles, c)
+		case strings.HasPrefix(entry, "acr:"):
+			v := strings.TrimSpace(strings.TrimPrefix(entry, "acr:"))
+			if v == "" {
+				return Rule{}, fmt.Errorf("empty acr in route rule %q", raw)
+			}
+			acrs = append(acrs, v)
+		case strings.HasPrefix(entry, "amr:"):
+			v := strings.TrimSpace(strings.TrimPrefix(entry, "amr:"))
+			if v == "" {
+				return Rule{}, fmt.Errorf("empty amr in route rule %q", raw)
+			}
+			amrs = append(amrs, v)
+		default:
+			return Rule{}, fmt.Errorf("requirement %q must use realm:, client:, acr:, or amr: prefix", entry)
 		}
 	}
-	if len(realmRoles) == 0 && len(clientRoles) == 0 {
-		return Rule{}, errors.New("route rule requires at least one role")
+	if len(realmRoles) == 0 && len(clientRoles) == 0 && len(acrs) == 0 && len(amrs) == 0 {
+		return Rule{}, errors.New("route rule requires at least one requirement")
 	}
 	return Rule{
 		Method:      method,
 		Pattern:     pattern,
 		RealmRoles:  realmRoles,
 		ClientRoles: clientRoles,
+		ACR:         acrs,
+		AMR:         amrs,
 	}, nil
 }
 
@@ -231,6 +256,14 @@ func (p *Policy) AuthorizePath(method, cleanPath string, id auth.Identity) error
 		}
 		for _, req := range rule.ClientRoles {
 			if !slices.Contains(id.ClientRoles, req) {
+				return auth.ErrForbidden
+			}
+		}
+		if len(rule.ACR) > 0 && !slices.Contains(rule.ACR, id.ACR) {
+			return auth.ErrForbidden
+		}
+		for _, req := range rule.AMR {
+			if !slices.Contains(id.AMR, req) {
 				return auth.ErrForbidden
 			}
 		}

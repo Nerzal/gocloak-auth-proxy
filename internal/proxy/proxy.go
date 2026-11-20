@@ -518,9 +518,13 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 			response.Header.Del("Referrer-Policy")
 			return nil
 		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			opts.Metrics.RecordRequest("reverse_proxy", "bad_gateway")
-			logger.Warn("upstream request failed", "category", classifyProxyError(err))
+			if traceID := ExtractTraceID(r); traceID != "" {
+				logger.Warn("upstream request failed", "category", classifyProxyError(err), "trace_id", traceID)
+			} else {
+				logger.Warn("upstream request failed", "category", classifyProxyError(err))
+			}
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
 	}
@@ -537,4 +541,49 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 		}
 		reverse.ServeHTTP(w, r.WithContext(context.WithValue(ctx, identityKey{}, payload)))
 	}), nil
+}
+
+// ExtractTraceID parses a W3C Trace Context traceparent header
+// (version-traceid-parentid-flags, e.g. 00-<32-hex>-<16-hex>-<2-hex>) and
+// returns the 32-char lowercase hex trace ID, or "" if absent/invalid.
+func ExtractTraceID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	tp := strings.TrimSpace(r.Header.Get("Traceparent"))
+	if len(tp) != 55 || tp[2] != '-' || tp[35] != '-' || tp[52] != '-' {
+		return ""
+	}
+	if !isLowerHex(tp[0:2]) || tp[0:2] == "ff" {
+		return ""
+	}
+	traceID := tp[3:35]
+	parentID := tp[36:52]
+	flags := tp[53:55]
+	if !isLowerHex(traceID) || !isLowerHex(parentID) || !isLowerHex(flags) {
+		return ""
+	}
+	if allZeros(traceID) || allZeros(parentID) {
+		return ""
+	}
+	return traceID
+}
+
+func isLowerHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func allZeros(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '0' {
+			return false
+		}
+	}
+	return true
 }
