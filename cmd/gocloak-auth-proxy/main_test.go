@@ -11,10 +11,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Nerzal/gocloak-auth-proxy/internal/config"
+	"github.com/Nerzal/gocloak-auth-proxy/internal/metrics"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -30,14 +33,25 @@ func mockKeycloak(t *testing.T) (*httptest.Server, *ecdsa.PrivateKey) {
 		"x": enc(key.X.FillBytes(make([]byte, 32))),
 		"y": enc(key.Y.FillBytes(make([]byte, 32))),
 	}
+	var srvURL string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/realms/demo/protocol/openid-connect/certs" {
+		switch r.URL.Path {
+		case "/realms/demo/protocol/openid-connect/certs":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{jwk}})
+		case "/realms/demo/protocol/openid-connect/token":
+			w.Header().Set("Content-Type", "application/json")
+			tok := strings.TrimPrefix(issueToken(t, key, srvURL+"/realms/demo", "my-api"), "Bearer ")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token":  tok,
+				"refresh_token": "r-1",
+				"expires_in":    300,
+			})
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []any{jwk}})
 	}))
+	srvURL = srv.URL
 	t.Cleanup(srv.Close)
 	return srv, key
 }
@@ -54,6 +68,7 @@ func issueToken(t *testing.T, key *ecdsa.PrivateKey, issuer, audience string) st
 		"sub":                "user-123",
 		"preferred_username": "alice",
 		"email":              "alice@example.test",
+		"tenant_id":          "acme",
 		"realm_access":       map[string]any{"roles": []string{"reader"}},
 	})
 	tok.Header["kid"] = "k1"
@@ -76,7 +91,8 @@ func TestEndToEndForwardAuthAndHealth(t *testing.T) {
 		JWKSRefreshInterval: time.Minute,
 		ClockSkew:           5 * time.Second,
 	}
-	handler, cache, err := buildHandler(cfg, slog.New(slog.DiscardHandler))
+	reg := metrics.New()
+	handler, cache, err := buildHandler(cfg, slog.New(slog.DiscardHandler), reg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,8 +142,8 @@ func TestEndToEndReverseProxy(t *testing.T) {
 		if r.Header.Get("Authorization") != "" || r.Header.Get("X-Real-IP") != "" || r.Header.Get("X_Auth_Request_Roles") != "" {
 			t.Errorf("untrusted headers leaked to upstream: %#v", r.Header)
 		}
-		if r.Header.Get("X-Auth-Request-User") != "alice" {
-			t.Errorf("missing verified user header: %#v", r.Header)
+		if r.Header.Get("X-Auth-Request-User") != "alice" || r.Header.Get("X-Tenant-ID") != "acme" {
+			t.Errorf("missing verified identity headers: %#v", r.Header)
 		}
 		_, _ = io.WriteString(w, "ok")
 	}))
@@ -138,9 +154,11 @@ func TestEndToEndReverseProxy(t *testing.T) {
 		Audience:            "my-api",
 		UpstreamURL:         upstream.URL,
 		ListenAddr:          ":0",
+		CustomClaimHeaders:  map[string]string{"X-Tenant-ID": "tenant_id"},
 		JWKSRefreshInterval: time.Minute,
 	}
-	handler, cache, err := buildHandler(cfg, slog.New(slog.DiscardHandler))
+	reg := metrics.New()
+	handler, cache, err := buildHandler(cfg, slog.New(slog.DiscardHandler), reg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,5 +184,78 @@ func TestEndToEndReverseProxy(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(body) != "ok" {
 		t.Fatalf("unexpected reverse-proxy response: %d %q", resp.StatusCode, string(body))
+	}
+}
+
+func TestEndToEndOIDCBrowserSSOAndMetrics(t *testing.T) {
+	kc, _ := mockKeycloak(t)
+	issuer := kc.URL + "/realms/demo"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Cookie"), "gocloak_session") {
+			t.Errorf("OIDC session cookie leaked to upstream: %q", r.Header.Get("Cookie"))
+		}
+		_, _ = io.WriteString(w, "hello:"+r.Header.Get("X-Auth-Request-User"))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Issuer:              issuer,
+		Audience:            "my-api",
+		ClientID:            "my-api",
+		UpstreamURL:         upstream.URL,
+		ListenAddr:          ":0",
+		JWKSRefreshInterval: time.Minute,
+		OIDCEnabled:         true,
+		OIDCRedirectURL:     "http://localhost/oauth2/callback",
+		OIDCCookieSecret:    strings.Repeat("s", 32),
+		OIDCCookieSecure:    false,
+		OIDCRedirectUnauth:  true,
+	}
+	reg := metrics.New()
+	handler, cache, err := buildHandler(cfg, slog.New(slog.DiscardHandler), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Start OIDC login.
+	startRec := httptest.NewRecorder()
+	handler.ServeHTTP(startRec, httptest.NewRequest(http.MethodGet, "/oauth2/start?rd=/dashboard", nil))
+	loc, _ := url.Parse(startRec.Header().Get("Location"))
+	state := loc.Query().Get("state")
+
+	// 2. Callback sets encrypted session cookie.
+	cbReq := httptest.NewRequest(http.MethodGet, "/oauth2/callback?code=c1&state="+url.QueryEscape(state), nil)
+	for _, c := range startRec.Result().Cookies() {
+		cbReq.AddCookie(c)
+	}
+	cbRec := httptest.NewRecorder()
+	handler.ServeHTTP(cbRec, cbReq)
+	if cbRec.Code != http.StatusFound || cbRec.Header().Get("Location") != "/dashboard" {
+		t.Fatalf("callback unexpected: %d %q", cbRec.Code, cbRec.Header().Get("Location"))
+	}
+
+	// 3. Subsequent browser request uses encrypted session cookie to reach upstream.
+	appReq := httptest.NewRequest(http.MethodGet, "http://proxy.test/dashboard", nil)
+	for _, c := range cbRec.Result().Cookies() {
+		if c.MaxAge > 0 {
+			appReq.AddCookie(c)
+		}
+	}
+	appRec := httptest.NewRecorder()
+	handler.ServeHTTP(appRec, appReq)
+	if appRec.Code != http.StatusOK || appRec.Body.String() != "hello:alice" {
+		t.Fatalf("SSO upstream failed: %d %q", appRec.Code, appRec.Body.String())
+	}
+
+	// 4. Metrics endpoint reflects JWKS refresh, OIDC login, and allowed reverse-proxy request.
+	mRec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(mRec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(mRec.Body.String(), `gocloak_auth_proxy_oidc_events_total{result="success"} 1`) ||
+		!strings.Contains(mRec.Body.String(), `gocloak_auth_proxy_requests_total{mode="reverse_proxy",result="allowed"} 1`) {
+		t.Fatalf("unexpected metrics:\n%s", mRec.Body.String())
 	}
 }

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -28,6 +29,9 @@ func validClaims() jwt.MapClaims {
 		"iss": "issuer", "aud": []string{"audience", "other"}, "typ": "Bearer",
 		"exp": now.Add(time.Minute).Unix(), "nbf": now.Add(-time.Minute).Unix(), "iat": now.Add(-time.Minute).Unix(),
 		"sub": "subject", "preferred_username": "alice", "email": "alice@example.test",
+		"email_verified": true, "azp": "app", "scope": "openid profile api:read", "acr": "2",
+		"organization": map[string]any{"acme": map[string]any{"id": "123"}},
+		"tenant_id":    "tenant-42",
 		"groups":       []string{"one", "two"},
 		"realm_access": map[string]any{"roles": []string{"reader", "shared"}},
 		"resource_access": map[string]any{
@@ -82,8 +86,14 @@ func TestVerify(t *testing.T) {
 			realm, client := []string{"reader"}, []string{"writer"}
 			v := verifier(t, tc.public, 0, realm, client)
 			realm[0], client[0] = "changed", "changed"
-			got, err := v.Verify(context.Background(), signed(t, tc.method, tc.key, validClaims(), nil))
-			want := Identity{User: "alice", Email: "alice@example.test", Groups: []string{"one", "two"}, Roles: []string{"reader", "shared", "writer"}}
+			tok := signed(t, tc.method, tc.key, validClaims(), nil)
+			got, err := v.Verify(context.Background(), tok)
+			want := Identity{
+				User: "alice", Email: "alice@example.test",
+				Groups: []string{"one", "two"}, Roles: []string{"reader", "shared", "writer"},
+				RealmRoles: []string{"reader", "shared"}, ClientRoles: []string{"writer", "shared"},
+				RawToken: strings.TrimPrefix(tok, "Bearer "),
+			}
 			if err != nil || !reflect.DeepEqual(got, want) {
 				t.Fatalf("got %#v, %v; want %#v", got, err, want)
 			}
@@ -133,6 +143,9 @@ func TestVerifyRejectsInvalidTokens(t *testing.T) {
 		{"no kid", nil, map[string]any{"kid": nil}},
 		{"critical extension", nil, map[string]any{"crit": []string{"example"}}},
 		{"b64 extension", nil, map[string]any{"b64": true}},
+		{"jku header", nil, map[string]any{"jku": "https://evil.test/jwks.json"}},
+		{"x5u header", nil, map[string]any{"x5u": "https://evil.test/cert.pem"}},
+		{"jwk header", nil, map[string]any{"jwk": map[string]any{"kty": "RSA"}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -286,4 +299,141 @@ func BenchmarkVerify(b *testing.B) {
 			}
 		}
 	})
+}
+
+type introspectFunc func(context.Context, string) (bool, error)
+
+func (f introspectFunc) Active(ctx context.Context, raw string) (bool, error) { return f(ctx, raw) }
+
+func TestExtendedAuthorizationAndAlgorithms(t *testing.T) {
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ec384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// EdDSA + full claim policies + custom claim header + active introspection.
+	v, err := NewWithOptions(testKeys{key: edPub}, Options{
+		Issuer:               "issuer",
+		Audience:             "audience",
+		AllowedAlgorithms:    []string{"EdDSA"},
+		RequiredRealmRoles:   []string{"missing", "reader"},
+		RequireAnyRole:       true,
+		RequiredGroups:       []string{"two"},
+		RequiredScopes:       []string{"openid", "api:read"},
+		RequiredACR:          []string{"2", "3"},
+		RequireEmailVerified: true,
+		RequiredAZP:          "app",
+		RequiredOrganization: "acme",
+		CustomClaimHeaders:   map[string]string{"X-Tenant-ID": "tenant_id"},
+		Introspector:         introspectFunc(func(context.Context, string) (bool, error) { return true, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok := signed(t, jwt.SigningMethodEdDSA, edPriv, validClaims(), nil)
+	id, err := v.Verify(context.Background(), tok)
+	if err != nil {
+		t.Fatalf("EdDSA verify failed: %v", err)
+	}
+	if id.Extra["X-Tenant-ID"] != "tenant-42" {
+		t.Fatalf("expected X-Tenant-ID=tenant-42, got %#v", id.Extra)
+	}
+
+	// Inactive introspection fails closed as 401 (not ErrForbidden).
+	vInactive, err := NewWithOptions(testKeys{key: edPub}, Options{
+		Issuer:            "issuer",
+		Audience:          "audience",
+		AllowedAlgorithms: []string{"EdDSA"},
+		Introspector:      introspectFunc(func(context.Context, string) (bool, error) { return false, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vInactive.Verify(context.Background(), tok); err == nil || errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected 401 for inactive token, got %v", err)
+	}
+
+	// Failing claim policies return ErrForbidden.
+	for _, tc := range []struct {
+		name string
+		opts Options
+	}{
+		{"missing group", Options{RequiredGroups: []string{"admins"}}},
+		{"missing scope", Options{RequiredScopes: []string{"api:write"}}},
+		{"wrong acr", Options{RequiredACR: []string{"3"}}},
+		{"wrong azp", Options{RequiredAZP: "other-client"}},
+		{"wrong org", Options{RequiredOrganization: "other-org"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.opts.Issuer = "issuer"
+			tc.opts.Audience = "audience"
+			tc.opts.AllowedAlgorithms = []string{"ES384"}
+			ver, err := NewWithOptions(testKeys{key: &ec384.PublicKey}, tc.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			es384Tok := signed(t, jwt.SigningMethodES384, ec384, validClaims(), nil)
+			if _, err := ver.Verify(context.Background(), es384Tok); !errors.Is(err, ErrForbidden) {
+				t.Fatalf("expected ErrForbidden for %s, got %v", tc.name, err)
+			}
+		})
+	}
+
+	// Unsupported algorithm rejected at construction time.
+	if _, err := NewWithOptions(testKeys{key: edPub}, Options{
+		Issuer: "issuer", Audience: "audience", AllowedAlgorithms: []string{"HS256"},
+	}); err == nil {
+		t.Fatal("accepted HS256 in AllowedAlgorithms")
+	}
+
+	// Local RBAC failure short-circuits before online introspection.
+	introCalled := false
+	vSkipIntro, err := NewWithOptions(testKeys{key: edPub}, Options{
+		Issuer:             "issuer",
+		Audience:           "audience",
+		AllowedAlgorithms:  []string{"EdDSA"},
+		RequiredRealmRoles: []string{"superadmin"},
+		Introspector: introspectFunc(func(context.Context, string) (bool, error) {
+			introCalled = true
+			return true, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vSkipIntro.Verify(context.Background(), tok); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if introCalled {
+		t.Fatal("introspector should not be called when local RBAC rejects token")
+	}
+}
+
+func BenchmarkVerifyEdDSA(b *testing.B) {
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		b.Fatal(err)
+	}
+	v, err := NewWithOptions(testKeys{key: edPub}, Options{
+		Issuer:             "issuer",
+		Audience:           "audience",
+		AllowedAlgorithms:  []string{"EdDSA"},
+		RequiredRealmRoles: []string{"reader"},
+		CustomClaimHeaders: map[string]string{"X-Tenant-ID": "tenant_id"},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	token := signed(b, jwt.SigningMethodEdDSA, edPriv, validClaims(), nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := v.Verify(context.Background(), token); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

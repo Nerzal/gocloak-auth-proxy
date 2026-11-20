@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -402,5 +403,65 @@ func TestRunRetriesQuicklyAndLogsFailures(t *testing.T) {
 	}
 	if strings.Contains(logged, "secret upstream body") {
 		t.Fatalf("leaked upstream response body in logs: %s", logged)
+	}
+}
+
+func TestAdditionalAlgorithmsAndCallback(t *testing.T) {
+	enc := base64.RawURLEncoding.EncodeToString
+	ec384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ec521, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keysPayload := []any{
+		map[string]any{"kid": "ps256", "kty": "RSA", "alg": "PS256", "use": "sig", "n": enc(rsaKey.N.Bytes()), "e": enc([]byte{1, 0, 1})},
+		map[string]any{"kid": "es384", "kty": "EC", "alg": "ES384", "crv": "P-384", "x": enc(ec384.X.FillBytes(make([]byte, 48))), "y": enc(ec384.Y.FillBytes(make([]byte, 48)))},
+		map[string]any{"kid": "es512", "kty": "EC", "alg": "ES512", "crv": "P-521", "x": enc(ec521.X.FillBytes(make([]byte, 66))), "y": enc(ec521.Y.FillBytes(make([]byte, 66)))},
+		map[string]any{"kid": "eddsa", "kty": "OKP", "alg": "EdDSA", "crv": "Ed25519", "x": enc(edPub)},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": keysPayload})
+	}))
+	defer srv.Close()
+
+	var refreshOK atomic.Int32
+	cache, err := NewWithOptions(srv.URL+"/realms/example", time.Minute, Options{
+		OnRefresh: func(ok bool) {
+			if ok {
+				refreshOK.Add(1)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if refreshOK.Load() != 1 {
+		t.Fatalf("expected OnRefresh(true) once, got %d", refreshOK.Load())
+	}
+	for _, tc := range [][2]string{{"ps256", "PS256"}, {"es384", "ES384"}, {"es512", "ES512"}, {"eddsa", "EdDSA"}} {
+		if _, err := cache.Key(context.Background(), tc[0], tc[1]); err != nil {
+			t.Errorf("Key(%s, %s) failed: %v", tc[0], tc[1], err)
+		}
+	}
+	if _, err := cache.Key(context.Background(), "ps256", "RS256"); err == nil {
+		t.Error("accepted PS256 key for RS256")
+	}
+	if _, err := cache.Key(context.Background(), "eddsa", "ES256"); err == nil {
+		t.Error("accepted EdDSA key for ES256")
 	}
 }

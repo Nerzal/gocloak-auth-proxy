@@ -1,56 +1,89 @@
 # gocloak-auth-proxy
 
-A Go authentication proxy for Keycloak-issued bearer tokens. It supports
-forward-auth integration or proxying requests to an upstream service.
+A security-first, high-performance Go authentication proxy built specifically for **Keycloak** using `github.com/Nerzal/gocloak/v14` and the Go standard library — with **minimal third-party dependencies** (enforced via `depguard`).
 
-## Configuration
+It supports **Forward-Auth** (Traefik / Nginx `auth_request`), **Reverse-Proxy**, and **Browser SSO (OIDC Authorization Code + PKCE)** out of the box.
 
-Configure the process with environment variables:
+## Features
 
-| Variable | Description |
-| --- | --- |
-| `ISSUER` | Required. Exact Keycloak realm issuer URL, e.g. `https://keycloak.example.com/realms/myrealm`. HTTPS is required except for HTTP on localhost or loopback. |
-| `AUDIENCE` | Required. Expected token audience. |
-| `UPSTREAM_URL` | Optional. Upstream URL; when omitted, run in forward-auth mode. |
-| `LISTEN_ADDR` | Listen address; default `:8080`. |
-| `CLIENT_ID` | Keycloak client ID; required when `REQUIRED_CLIENT_ROLES` is set. |
-| `REQUIRED_REALM_ROLES` | Comma-separated required realm roles. |
-| `REQUIRED_CLIENT_ROLES` | Comma-separated required roles for `CLIENT_ID`. |
-| `HEADER_USER` | Optional. Identity header name for the verified username/subject; default `X-Auth-Request-User`. |
-| `HEADER_EMAIL` | Optional. Identity header name for the verified email; default `X-Auth-Request-Email`. |
-| `HEADER_GROUPS` | Optional. Identity header name for verified groups; default `X-Auth-Request-Groups`. |
-| `HEADER_ROLES` | Optional. Identity header name for verified roles; default `X-Auth-Request-Roles`. |
-| `JWKS_REFRESH_INTERVAL` | JWKS refresh interval as a Go duration; default `5m`, allowed `1s`–`12h`. |
-| `CLOCK_SKEW` | Token validation clock tolerance as a Go duration; default `30s`, allowed `0s`–`30s`. |
+- **Zero-Network, Lock-Free JWT Hot Path:** Local signature verification against an immutable `atomic.Pointer` JWKS snapshot with coalesced, rate-limited on-demand rotation and bounded exponential backoff.
+- **Full Asymmetric JWS Support:** `RS256/384/512`, `PS256/384/512`, `ES256/384/512`, and `EdDSA` (`OKP/Ed25519`). Strictly rejects `none` and `HS*` algorithms as well as `crit`/`b64`/`jku`/`x5u`/`jwk` header extensions.
+- **Keycloak-Native Authorization:**
+  - Realm & client roles (`all` or `any` match mode)
+  - Groups (`all` or `any`), OAuth `scope`, `acr` (MFA level), `email_verified`, `azp`, and Keycloak 26+ `organization`
+  - Optional online **Token Introspection** (`RetrospectToken`) with a bounded, SHA-256-keyed TTL cache & singleflight coalescing
+  - Optional **Keycloak UMA 2.0** resource authorization (`GetRequestingPartyPermissions`, including `#method:<HTTP_METHOD>` scopes)
+  - Path/method **ACLs** (`PUBLIC_PATHS`, `OPTIONAL_AUTH_PATHS`, `ALLOW_CORS_PREFLIGHT`, `ROUTE_RULES`) with path-traversal and delimiter-injection protection
+- **Browser SSO (OIDC):** Authorization Code Flow with PKCE (`S256`), `nonce`/`iss`/`aud`/`exp` validation, AES-256-GCM encrypted chunked session cookies (handles >4 KB Keycloak tokens), coalesced refresh-token rotation, CSRF-protected `/oauth2/logout`, and automatic proxy-cookie stripping before upstream forwarding.
+- **Hardened & Observable:** Header spoofing prevention (including `_`/`-` WSGI/CGI alias normalization and `X-Real-IP`), TLS 1.2+ with custom CA bundles, HSTS on TLS listeners, redacted JSON logging (`log/slog`), zero-dependency Prometheus `/metrics`, `/healthz`, `/readyz`, and nonroot `distroless` container packaging.
 
-All configured roles are required. Tokens must be access tokens (`typ: "Bearer"`)
-with valid `iss`, `aud`, `exp`, and `iat` claims (`nbf` is validated when
-present; configure an Audience protocol mapper in Keycloak if your realm tokens
-do not include the target `AUDIENCE`). Do not send access tokens to untrusted
-services. Use HTTPS for the issuer in production, and terminate TLS at a trusted
-ingress. Restrict access to the proxy and upstream to trusted networks; do not
-allow clients to bypass the proxy. The service itself listens over HTTP.
+---
 
-`/healthz` and `/readyz` are unauthenticated health endpoints. Without an
-upstream, use `/auth` as the forward-auth endpoint. With `UPSTREAM_URL` set,
-other requests are reverse-proxied to that upstream (note that `/healthz` and
-`/readyz` are reserved by the proxy).
+## Quick Start
 
-## Architecture and integration
+Go 1.26 or newer is required.
 
-The proxy retrieves Keycloak realm signing keys and validates bearer tokens
-locally. Successful authentication exposes the verified user, email, groups and
-roles as `X-Auth-Request-User`, `X-Auth-Request-Email`,
-`X-Auth-Request-Groups`, and `X-Auth-Request-Roles` (or the configured
-`HEADER_*` names). In reverse-proxy mode, client-supplied identity, forwarding
-(`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, including underscore aliases), and
-bearer headers are removed before forwarding; verified identity headers are then
-added.
+### 1. Forward-Auth Mode (API / Ingress)
 
-For forward-auth, the ingress must pass the bearer `Authorization` header to
-`/auth`, deny access when it fails, and overwrite any client-supplied identity
-headers with the response values. For example, with nginx's `auth_request`
-module, replace the upstream names below with your trusted services:
+```sh
+export ISSUER=https://keycloak.example.com/realms/myrealm
+export AUDIENCE=my-api
+go run ./cmd/gocloak-auth-proxy
+```
+
+### 2. Reverse-Proxy Mode (with RBAC & Custom Claims)
+
+```sh
+export ISSUER=https://keycloak.example.com/realms/myrealm
+export AUDIENCE=my-api
+export UPSTREAM_URL=http://127.0.0.1:3000
+export REQUIRED_REALM_ROLES=reader
+export CUSTOM_CLAIM_HEADERS="X-Tenant-ID=tenant_id"
+go run ./cmd/gocloak-auth-proxy
+```
+
+### 3. Browser SSO Mode (OIDC + PKCE + Encrypted Cookies)
+
+```sh
+export ISSUER=https://keycloak.example.com/realms/myrealm
+export AUDIENCE=my-web-app
+export CLIENT_ID=my-web-app
+export CLIENT_SECRET=your-client-secret
+export UPSTREAM_URL=http://127.0.0.1:3000
+export OIDC_ENABLED=true
+export OIDC_REDIRECT_URL=https://app.example.com/oauth2/callback
+export OIDC_COOKIE_SECRET="$(openssl rand -base64 32)"
+go run ./cmd/gocloak-auth-proxy
+```
+
+### 4. Container
+
+```sh
+docker build -t gocloak-auth-proxy .
+docker run --rm -p 8080:8080 \
+  -e ISSUER=https://keycloak.example.com/realms/myrealm \
+  -e AUDIENCE=my-api \
+  gocloak-auth-proxy
+```
+
+---
+
+## Endpoints
+
+| Path | Auth | Description |
+| --- | --- | --- |
+| `/healthz` | Public | Liveness probe (`200 OK`) |
+| `/readyz` | Public | Readiness probe (`200 OK` when a valid, unexpired JWKS snapshot is loaded; otherwise `503`) |
+| `/auth` | Protected | Forward-Auth endpoint (active when `UPSTREAM_URL` is omitted) |
+| `/*` | Protected | Reverse-Proxy target (active when `UPSTREAM_URL` is set) |
+| `/oauth2/start`, `/oauth2/callback`, `/oauth2/logout` | OIDC Flow | Browser SSO endpoints (active when `OIDC_ENABLED=true`) |
+| `/metrics` | Dedicated Port | Prometheus / OpenMetrics exposition (served on `METRICS_ADDR` when configured) |
+
+---
+
+## Ingress Integration
+
+### Nginx (`auth_request`)
 
 ```nginx
 location = /_auth {
@@ -67,6 +100,7 @@ location / {
     auth_request_set $auth_email $upstream_http_x_auth_request_email;
     auth_request_set $auth_groups $upstream_http_x_auth_request_groups;
     auth_request_set $auth_roles $upstream_http_x_auth_request_roles;
+
     # Do not forward arbitrary client headers, including spoofed identity headers.
     proxy_pass_request_headers off;
     proxy_set_header Content-Type $http_content_type;
@@ -80,10 +114,7 @@ location / {
 }
 ```
 
-This example intentionally forwards only the listed request headers. Add other
-headers only after reviewing whether clients may safely control them.
-
-With Traefik's `forwardAuth` middleware:
+### Traefik (`forwardAuth`)
 
 ```yaml
 http:
@@ -99,34 +130,134 @@ http:
           - "X-Auth-Request-Roles"
 ```
 
-In reverse-proxy mode instead, set `UPSTREAM_URL` to the application URL and
-route traffic to the proxy; no ingress auth subrequest is needed.
+---
 
-## Run
+## Configuration Reference
 
-Go 1.26 or newer is required.
+### Core
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ISSUER` | *(required)* | Exact Keycloak realm issuer URL, e.g. `https://keycloak.example.com/realms/myrealm`. HTTPS required except for localhost/loopback. |
+| `AUDIENCE` | *(required)* | Expected `aud` claim. Configure an Audience protocol mapper in Keycloak if your tokens only emit `aud: "account"`. |
+| `UPSTREAM_URL` | `""` | Fixed reverse-proxy upstream URL. When omitted, runs in forward-auth mode on `/auth`. |
+| `LISTEN_ADDR` | `:8080` | Proxy listen address (`host:port`). |
+| `CLIENT_ID` | `""` | Keycloak client ID; required for client roles, introspection, or OIDC SSO. |
+| `CLIENT_SECRET` | `""` | Keycloak client secret; required for `INTROSPECTION_ENABLED` and confidential OIDC clients. |
+| `ALLOWED_ALGORITHMS` | `RS256,ES256` | Comma-separated allowed JWS algorithms (`RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `EdDSA`). |
+| `JWKS_REFRESH_INTERVAL` | `5m` | Periodic JWKS refresh interval (`1s`–`12h`). |
+| `CLOCK_SKEW` | `30s` | Token validation leeway (`0s`–`30s`). |
+
+### Authorization & Claims
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `REQUIRED_REALM_ROLES` | `""` | Comma-separated required Keycloak realm roles. |
+| `REQUIRED_CLIENT_ROLES` | `""` | Comma-separated required roles for `CLIENT_ID`. |
+| `ROLE_MATCH_MODE` | `all` | Role matching logic: `all` (AND) or `any` (OR). |
+| `REQUIRED_GROUPS` | `""` | Comma-separated required groups. |
+| `GROUP_MATCH_MODE` | `all` | Group matching logic: `all` (AND) or `any` (OR). |
+| `REQUIRED_SCOPES` | `""` | Comma-separated required OAuth scopes (from `scope` claim). |
+| `REQUIRED_ACR` | `""` | Comma-separated accepted `acr` (MFA / LoA) values. |
+| `REQUIRE_EMAIL_VERIFIED` | `false` | Require `email_verified: true`. |
+| `REQUIRED_AZP` | `""` | Require exact `azp` (authorized party) match. |
+| `REQUIRED_ORGANIZATION` | `""` | Require Keycloak 26+ `organization` claim membership. |
+
+### Identity Headers & Token Forwarding
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `HEADER_USER` | `X-Auth-Request-User` | Header name for verified `preferred_username` (fallback `sub`). |
+| `HEADER_EMAIL` | `X-Auth-Request-Email` | Header name for verified `email`. |
+| `HEADER_GROUPS` | `X-Auth-Request-Groups` | Header name for verified comma-separated `groups`. |
+| `HEADER_ROLES` | `X-Auth-Request-Roles` | Header name for verified comma-separated realm + client `roles`. |
+| `CUSTOM_CLAIM_HEADERS` | `""` | Comma-separated `Header-Name=claim_name` mappings forwarded from verified JWT claims. |
+| `PASS_ACCESS_TOKEN` | `false` | Forward verified access token (`Authorization` in reverse-proxy, `X-Auth-Request-Access-Token` in forward-auth). |
+
+### Keycloak Online Authorization & Path ACLs
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `INTROSPECTION_ENABLED` | `false` | Enable online Keycloak `RetrospectToken` check after local RBAC validation. |
+| `INTROSPECTION_CACHE_TTL` | `15s` | Bounded SHA-256-keyed introspection cache TTL (`0s`–`5m`). |
+| `UMA_ENABLED` | `false` | Enable Keycloak UMA 2.0 resource authorization (requires `UPSTREAM_URL`). |
+| `UMA_METHOD_SCOPE` | `false` | Append `#method:<HTTP_METHOD>` scope to UMA URI permission checks. |
+| `PUBLIC_PATHS` | `""` | Comma-separated path patterns (`/public/*`, `/status`) bypassing authentication. |
+| `OPTIONAL_AUTH_PATHS` | `""` | Comma-separated patterns allowing anonymous requests while strictly validating tokens if present. |
+| `ALLOW_CORS_PREFLIGHT` | `false` | Allow CORS `OPTIONS` preflight requests without authentication. |
+| `ROUTE_RULES` | `""` | Semicolon-separated route ACLs, e.g. `POST:/admin/*=realm:admin,client:writer` (requires `UPSTREAM_URL`). |
+
+### Browser SSO (OIDC)
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OIDC_ENABLED` | `false` | Enable Authorization Code + PKCE browser SSO (`/oauth2/*`). |
+| `OIDC_REDIRECT_URL` | `""` | Required when `OIDC_ENABLED=true`. Absolute callback URL (e.g. `https://app.example.com/oauth2/callback`). |
+| `OIDC_COOKIE_SECRET` | `""` | Required when `OIDC_ENABLED=true`. Secret for AES-256-GCM cookie encryption (min 32 characters). |
+| `OIDC_POST_LOGOUT_URL` | `/` | Safe relative path or absolute HTTP(S) URL redirected to after `/oauth2/logout`. |
+| `OIDC_COOKIE_NAME` | `__Host-gocloak_session` | Session cookie name (defaults to `gocloak_session` when `OIDC_COOKIE_SECURE=false`). |
+| `OIDC_COOKIE_SECURE` | `true` | Set `Secure` attribute on OIDC cookies (`false` for local HTTP development only). |
+| `OIDC_COOKIE_SAMESITE` | `lax` | Cookie `SameSite` policy: `lax`, `strict`, or `none` (requires `OIDC_COOKIE_SECURE=true`). |
+| `OIDC_SCOPES` | `openid,profile,email` | Comma-separated OIDC scopes requested during login. |
+| `OIDC_SESSION_MAX_AGE` | `24h` | Absolute session lifetime enforced both on cookies and inside the encrypted payload. |
+| `OIDC_REDIRECT` | `true` | Redirect unauthenticated HTML `GET` requests (`302`) to `/oauth2/start` instead of returning `401`. |
+
+### TLS, Timeouts & Observability
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `KEYCLOAK_CA_FILE` | `""` | Optional PEM CA bundle for TLS connections to Keycloak. |
+| `UPSTREAM_CA_FILE` | `""` | Optional PEM CA bundle for TLS connections to the reverse-proxy upstream. |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | `""` | Optional TLS 1.2+ certificate and key for the proxy listener (enables HSTS automatically). |
+| `METRICS_ADDR` | `""` | Optional dedicated listen address for Prometheus `/metrics` (e.g. `:9090`); keep internal, never expose publicly. |
+| `LOG_LEVEL` | `info` | Structured JSON log level: `debug`, `info`, `warn`, `error`. |
+| `SERVER_READ_HEADER_TIMEOUT` / `SERVER_READ_TIMEOUT` | `5s` / `15s` | Inbound HTTP server header and body read timeouts. |
+| `SERVER_WRITE_TIMEOUT` / `SERVER_IDLE_TIMEOUT` | `30s` / `60s` | Inbound HTTP write/idle timeouts (set `SERVER_WRITE_TIMEOUT=0s` for WebSockets/SSE). |
+| `UPSTREAM_HEADER_TIMEOUT` / `UPSTREAM_REQUEST_TIMEOUT` | `15s` / `25s` | Outbound reverse-proxy timeouts (set `UPSTREAM_REQUEST_TIMEOUT=0s` for WebSockets/SSE). |
+
+---
+
+## Benchmarks
+
+Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 1.27 (`linux/amd64`, Intel Xeon 6985P-C):
+
+| Benchmark | Time / Op | Bytes / Op | Allocs / Op | Scope |
+| --- | ---: | ---: | ---: | --- |
+| `BenchmarkPolicy` | `118.8 ns` | `0 B` | `0` | Path normalization + ACL mode + route role check |
+| `BenchmarkIntrospectorCacheHit` | `243.1 ns` | `0 B` | `0` | Parallel `RLock` introspection cache hit (SHA-256 token lookup) |
+| `BenchmarkForwardAuth` | `2.26 µs` | `2416 B` | `25` | Header scrubbing + identity injection (mock verifier + `httptest.ResponseRecorder`) |
+| `BenchmarkReadSession` | `4.26 µs` | `2761 B` | `6` | OIDC in-place AES-256-GCM session cookie decryption & JSON decode |
+| `BenchmarkVerify/RS256` | `37.5 µs` | `6379 B` | `79` | Full RS256 (2048-bit) JWT signature + claims + RBAC verification |
+| `BenchmarkVerifyEdDSA` | `58.6 µs` | `8509 B` | `104` | Full Ed25519 (`EdDSA`) JWT verification + `CUSTOM_CLAIM_HEADERS` extraction |
+| `BenchmarkVerify/ES256` | `75.5 µs` | `5995 B` | `90` | Full ES256 (P-256) JWT signature + claims + RBAC verification |
+
+Run locally to reproduce on your hardware:
 
 ```sh
-export ISSUER=https://keycloak.example.com/realms/myrealm
-export AUDIENCE=my-api
-go run ./cmd/gocloak-auth-proxy
+make bench
 ```
 
-For a container:
+---
 
-```sh
-docker build -t gocloak-auth-proxy .
-docker run --rm -p 8080:8080 \
-  -e ISSUER=https://keycloak.example.com/realms/myrealm \
-  -e AUDIENCE=my-api \
-  gocloak-auth-proxy
-```
+## Security Model
+
+- **Fail-Closed by Default:** Missing/malformed tokens, wrong `typ` (only `"Bearer"` is accepted), expired claims, unknown `kid`, JWKS/introspection/UMA errors, or path-traversal attempts (`..`, `%2f`, `%2e`, `%5c`, `%23`, `#`, `%00`) are rejected with `401`/`403`.
+- **Anti-Spoofing:** All inbound `X-Auth-Request-*`, `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `Authorization`, and configured custom identity headers (including `_`/`-` aliases) are stripped before verification and before upstream forwarding. In OIDC mode, proxy session/state cookies are stripped from outbound upstream requests.
+- **Zero Secret Leakage:** Structured JSON logs redact sensitive keys (`token`, `authorization`, `cookie`, `secret`, `password`, `email`, `bearer`, `jwt`, `credential`, `session`) and string values containing `Bearer ` tokens. Client error responses never expose internal or upstream details.
+
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+---
 
 ## Development
 
-Run `make test`, `make test-race`, `make bench`, or `make build`. `make check`
-combines lint, security checks, race-enabled tests, benchmarks, and build. `make lint`
-requires golangci-lint v2.15.0; `make vuln` requires govulncheck v1.7.0; and
-`make security` also requires gosec v2.29.0. CI runs these checks and CodeQL.
+```sh
+make test        # Unit tests
+make test-race   # Race detector + coverage
+make bench       # Benchmarks with memory allocation stats
+make lint        # golangci-lint (includes depguard allowlist & staticcheck)
+make security    # govulncheck + gosec
+make check       # Full local quality gate (lint, security, test-race, bench, build)
+```
 
-See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+CI runs `test` (`-race`), `lint`, `security` (`govulncheck` + `gosec`), and `CodeQL` on every push and pull request.
