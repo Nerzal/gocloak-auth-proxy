@@ -23,6 +23,9 @@ import (
 // Identity contains the values suitable for forwarding as identity headers.
 type Identity struct {
 	User, Email   string
+	Subject, SID  string
+	ACR           string
+	AMR           []string
 	Groups, Roles []string
 	RealmRoles    []string
 	ClientRoles   []string
@@ -100,12 +103,14 @@ func (o *orgClaim) UnmarshalJSON(data []byte) error {
 type claims struct {
 	jwt.RegisteredClaims
 	Type           string                `json:"typ"`
+	SID            string                `json:"sid"`
 	Username       string                `json:"preferred_username"`
 	Email          string                `json:"email"`
 	EmailVerified  bool                  `json:"email_verified"`
 	AZP            string                `json:"azp"`
 	Scope          string                `json:"scope"`
 	ACR            string                `json:"acr"`
+	AMR            []string              `json:"amr"`
 	Organization   orgClaim              `json:"organization"`
 	Groups         []string              `json:"groups"`
 	RealmAccess    roleClaims            `json:"realm_access"`
@@ -126,6 +131,7 @@ type Options struct {
 	RequireAnyGroup      bool
 	RequiredScopes       []string
 	RequiredACR          []string
+	RequiredAMR          []string
 	RequireEmailVerified bool
 	RequiredAZP          string
 	RequiredOrganization string
@@ -145,6 +151,7 @@ type Verifier struct {
 	requireAnyGroup      bool
 	requiredScopes       []string
 	requiredACR          []string
+	requiredAMR          []string
 	requireEmailVerified bool
 	requiredAZP          string
 	requiredOrg          string
@@ -192,7 +199,7 @@ func NewWithOptions(keys KeySource, opts Options) (*Verifier, error) {
 			}
 		}
 	}
-	for _, list := range [][]string{opts.RequiredRealmRoles, opts.RequiredClientRoles, opts.RequiredGroups, opts.RequiredScopes, opts.RequiredACR} {
+	for _, list := range [][]string{opts.RequiredRealmRoles, opts.RequiredClientRoles, opts.RequiredGroups, opts.RequiredScopes, opts.RequiredACR, opts.RequiredAMR} {
 		for _, item := range list {
 			if strings.TrimSpace(item) == "" || !safeHeaderValue(item) {
 				return nil, errors.New("invalid verifier configuration")
@@ -225,6 +232,7 @@ func NewWithOptions(keys KeySource, opts Options) (*Verifier, error) {
 		requireAnyGroup:      opts.RequireAnyGroup,
 		requiredScopes:       append([]string(nil), opts.RequiredScopes...),
 		requiredACR:          append([]string(nil), opts.RequiredACR...),
+		requiredAMR:          append([]string(nil), opts.RequiredAMR...),
 		requireEmailVerified: opts.RequireEmailVerified,
 		requiredAZP:          opts.RequiredAZP,
 		requiredOrg:          opts.RequiredOrganization,
@@ -347,6 +355,10 @@ func (v *Verifier) identity(c claims, raw string) (Identity, error) {
 	return Identity{
 		User:        user,
 		Email:       c.Email,
+		Subject:     c.Subject,
+		SID:         c.SID,
+		ACR:         c.ACR,
+		AMR:         c.AMR,
 		Groups:      c.Groups,
 		Roles:       roles,
 		RealmRoles:  c.RealmAccess.Roles,
@@ -373,6 +385,9 @@ func (v *Verifier) authorize(c claims, clientRoles []string) bool {
 		}
 	}
 	if len(v.requiredACR) > 0 && !slices.Contains(v.requiredACR, c.ACR) {
+		return false
+	}
+	if len(v.requiredAMR) > 0 && !matchValues(c.AMR, v.requiredAMR, false) {
 		return false
 	}
 	if v.requireEmailVerified && !c.EmailVerified {

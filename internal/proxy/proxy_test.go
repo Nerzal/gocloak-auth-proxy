@@ -388,3 +388,26 @@ func TestProxyExtendedFeatures(t *testing.T) {
 		t.Fatalf("expected 302 to /oauth2/start, got %d %q", redirRec.Code, redirRec.Header().Get("Location"))
 	}
 }
+
+func TestExtractTraceID(t *testing.T) {
+	valid := "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.test/", nil)
+	req.Header.Set("traceparent", valid)
+	if got := ExtractTraceID(req); got != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Fatalf("ExtractTraceID = %q, want 4bf92f3577b34da6a3ce929d0e0e4736", got)
+	}
+	for _, bad := range []string{
+		"",
+		"not-a-traceparent",
+		"ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+		"00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+		"00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+	} {
+		r := httptest.NewRequest(http.MethodGet, "http://proxy.test/", nil)
+		r.Header.Set("traceparent", bad)
+		if got := ExtractTraceID(r); got != "" {
+			t.Errorf("ExtractTraceID(%q) = %q, want empty", bad, got)
+		}
+	}
+}

@@ -105,6 +105,25 @@ func TestEncodedPathTraversalRejected(t *testing.T) {
 	}
 }
 
+func TestRouteStepUpACRandAMR(t *testing.T) {
+	p, err := New(nil, nil, false, []string{
+		"POST:/admin/*=realm:admin,acr:aal2,amr:mfa",
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.test/admin/keys", nil)
+	if err := p.Authorize(req, auth.Identity{RealmRoles: []string{"admin"}, ACR: "aal2", AMR: []string{"pwd", "mfa"}}); err != nil {
+		t.Fatalf("expected step-up identity to be allowed, got %v", err)
+	}
+	if err := p.Authorize(req, auth.Identity{RealmRoles: []string{"admin"}, ACR: "aal1", AMR: []string{"pwd", "mfa"}}); err == nil {
+		t.Fatal("expected wrong ACR to be denied")
+	}
+	if err := p.Authorize(req, auth.Identity{RealmRoles: []string{"admin"}, ACR: "aal2", AMR: []string{"pwd"}}); err == nil {
+		t.Fatal("expected missing AMR to be denied")
+	}
+}
+
 func BenchmarkPolicy(b *testing.B) {
 	p, err := New([]string{"/public/*", "/status"}, []string{"/catalog/*"}, true, []string{
 		"POST:/admin/*=realm:admin,client:writer",

@@ -34,13 +34,13 @@ func main() {
 }
 
 func buildHandler(cfg config.Config, logger *slog.Logger, reg *metrics.Registry) (http.Handler, *jwks.Cache, error) {
-	kcTLS, err := tlsutil.ClientConfig(cfg.KeycloakCAFile)
+	kcTLS, err := tlsutil.ClientConfigWithCert(cfg.KeycloakCAFile, cfg.KeycloakClientCertFile, cfg.KeycloakClientKeyFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid KEYCLOAK_CA_FILE: %w", err)
+		return nil, nil, fmt.Errorf("invalid Keycloak TLS configuration: %w", err)
 	}
-	upstreamTLS, err := tlsutil.ClientConfig(cfg.UpstreamCAFile)
+	upstreamTLS, err := tlsutil.ClientConfigWithCert(cfg.UpstreamCAFile, cfg.UpstreamClientCertFile, cfg.UpstreamClientKeyFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid UPSTREAM_CA_FILE: %w", err)
+		return nil, nil, fmt.Errorf("invalid upstream TLS configuration: %w", err)
 	}
 	cache, err := jwks.NewWithOptions(cfg.Issuer, cfg.JWKSRefreshInterval, jwks.Options{
 		Logger:    logger,
@@ -75,6 +75,7 @@ func buildHandler(cfg config.Config, logger *slog.Logger, reg *metrics.Registry)
 		RequireAnyGroup:      cfg.RequireAnyGroup,
 		RequiredScopes:       cfg.RequiredScopes,
 		RequiredACR:          cfg.RequiredACR,
+		RequiredAMR:          cfg.RequiredAMR,
 		RequireEmailVerified: cfg.RequireEmailVerified,
 		RequiredAZP:          cfg.RequiredAZP,
 		RequiredOrganization: cfg.RequiredOrganization,
@@ -116,11 +117,16 @@ func buildHandler(cfg config.Config, logger *slog.Logger, reg *metrics.Registry)
 			PostLogoutURL:           cfg.OIDCPostLogoutURL,
 			CookieSecret:            cfg.OIDCCookieSecret,
 			CookieName:              cfg.OIDCCookieName,
+			CookieDomain:            cfg.OIDCCookieDomain,
 			CookieSecure:            cfg.OIDCCookieSecure,
 			CookieSameSite:          cfg.OIDCCookieSameSite,
 			Scopes:                  cfg.OIDCScopes,
 			SessionMaxAge:           cfg.OIDCSessionMaxAge,
 			RedirectUnauthenticated: cfg.OIDCRedirectUnauth,
+			AllowedRedirectDomains:  cfg.OIDCAllowedRedirectDomains,
+			Keys:                    cache,
+			AllowedAlgorithms:       cfg.AllowedAlgorithms,
+			ClockSkew:               cfg.ClockSkew,
 			TLSConfig:               kcTLS,
 			Logger:                  logger,
 			OnEvent:                 reg.RecordOIDC,

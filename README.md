@@ -138,6 +138,7 @@ http:
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `CONFIG_FILE` | `""` | Optional path to a strict JSON configuration file (unknown fields rejected; environment variables override file values). |
 | `ISSUER` | *(required)* | Exact Keycloak realm issuer URL, e.g. `https://keycloak.example.com/realms/myrealm`. HTTPS required except for localhost/loopback. |
 | `AUDIENCE` | *(required)* | Expected `aud` claim. Configure an Audience protocol mapper in Keycloak if your tokens only emit `aud: "account"`. |
 | `UPSTREAM_URL` | `""` | Fixed reverse-proxy upstream URL. When omitted, runs in forward-auth mode on `/auth`. |
@@ -159,6 +160,7 @@ http:
 | `GROUP_MATCH_MODE` | `all` | Group matching logic: `all` (AND) or `any` (OR). |
 | `REQUIRED_SCOPES` | `""` | Comma-separated required OAuth scopes (from `scope` claim). |
 | `REQUIRED_ACR` | `""` | Comma-separated accepted `acr` (MFA / LoA) values. |
+| `REQUIRED_AMR` | `""` | Comma-separated required `amr` (Authentication Methods References, e.g. `mfa,hwk`) values. |
 | `REQUIRE_EMAIL_VERIFIED` | `false` | Require `email_verified: true`. |
 | `REQUIRED_AZP` | `""` | Require exact `azp` (authorized party) match. |
 | `REQUIRED_ORGANIZATION` | `""` | Require Keycloak 26+ `organization` claim membership. |
@@ -185,32 +187,36 @@ http:
 | `PUBLIC_PATHS` | `""` | Comma-separated path patterns (`/public/*`, `/status`) bypassing authentication. |
 | `OPTIONAL_AUTH_PATHS` | `""` | Comma-separated patterns allowing anonymous requests while strictly validating tokens if present. |
 | `ALLOW_CORS_PREFLIGHT` | `false` | Allow CORS `OPTIONS` preflight requests without authentication. |
-| `ROUTE_RULES` | `""` | Semicolon-separated route ACLs, e.g. `POST:/admin/*=realm:admin,client:writer` (requires `UPSTREAM_URL`). |
+| `ROUTE_RULES` | `""` | Semicolon-separated route ACLs supporting `realm:`, `client:`, `acr:`, and `amr:`, e.g. `POST:/admin/*=realm:admin,acr:aal2,amr:mfa` (requires `UPSTREAM_URL`). |
 
 ### Browser SSO (OIDC)
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `OIDC_ENABLED` | `false` | Enable Authorization Code + PKCE browser SSO (`/oauth2/*`). |
+| `OIDC_ENABLED` | `false` | Enable Authorization Code + PKCE browser SSO (`/oauth2/start`, `/oauth2/callback`, `/oauth2/logout`, `/oauth2/backchannel-logout`). |
 | `OIDC_REDIRECT_URL` | `""` | Required when `OIDC_ENABLED=true`. Absolute callback URL (e.g. `https://app.example.com/oauth2/callback`). |
 | `OIDC_COOKIE_SECRET` | `""` | Required when `OIDC_ENABLED=true`. Secret for AES-256-GCM cookie encryption (min 32 characters). |
 | `OIDC_POST_LOGOUT_URL` | `/` | Safe relative path or absolute HTTP(S) URL redirected to after `/oauth2/logout`. |
-| `OIDC_COOKIE_NAME` | `__Host-gocloak_session` | Session cookie name (defaults to `gocloak_session` when `OIDC_COOKIE_SECURE=false`). |
+| `OIDC_COOKIE_NAME` | `__Host-gocloak_session` | Session cookie name (defaults to `gocloak_session` when `OIDC_COOKIE_SECURE=false` or `OIDC_COOKIE_DOMAIN` is set). |
+| `OIDC_COOKIE_DOMAIN` | `""` | Optional cookie `Domain` attribute (e.g. `.example.com`) for multi-subdomain SSO (incompatible with `__Host-` prefix). |
 | `OIDC_COOKIE_SECURE` | `true` | Set `Secure` attribute on OIDC cookies (`false` for local HTTP development only). |
 | `OIDC_COOKIE_SAMESITE` | `lax` | Cookie `SameSite` policy: `lax`, `strict`, or `none` (requires `OIDC_COOKIE_SECURE=true`). |
 | `OIDC_SCOPES` | `openid,profile,email` | Comma-separated OIDC scopes requested during login. |
 | `OIDC_SESSION_MAX_AGE` | `24h` | Absolute session lifetime enforced both on cookies and inside the encrypted payload. |
 | `OIDC_REDIRECT` | `true` | Redirect unauthenticated HTML `GET` requests (`302`) to `/oauth2/start` instead of returning `401`. |
+| `OIDC_ALLOWED_REDIRECT_DOMAINS` | `""` | Comma-separated allowlist of redirect hosts or `.suffix` domains (e.g. `app1.example.com,.example.com`) for multi-domain SSO. |
 
 ### TLS, Timeouts & Observability
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `KEYCLOAK_CA_FILE` | `""` | Optional PEM CA bundle for TLS connections to Keycloak. |
+| `KEYCLOAK_CLIENT_CERT_FILE` / `KEYCLOAK_CLIENT_KEY_FILE` | `""` | Optional mTLS client certificate and private key for connections to Keycloak. |
 | `UPSTREAM_CA_FILE` | `""` | Optional PEM CA bundle for TLS connections to the reverse-proxy upstream. |
+| `UPSTREAM_CLIENT_CERT_FILE` / `UPSTREAM_CLIENT_KEY_FILE` | `""` | Optional mTLS client certificate and private key for connections to the upstream. |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | `""` | Optional TLS 1.2+ certificate and key for the proxy listener (enables HSTS automatically). |
 | `METRICS_ADDR` | `""` | Optional dedicated listen address for Prometheus `/metrics` (e.g. `:9090`); keep internal, never expose publicly. |
-| `LOG_LEVEL` | `info` | Structured JSON log level: `debug`, `info`, `warn`, `error`. |
+| `LOG_LEVEL` | `info` | Structured JSON log level: `debug`, `info`, `warn`, `error` (correlates W3C `traceparent` as `trace_id`). |
 | `SERVER_READ_HEADER_TIMEOUT` / `SERVER_READ_TIMEOUT` | `5s` / `15s` | Inbound HTTP server header and body read timeouts. |
 | `SERVER_WRITE_TIMEOUT` / `SERVER_IDLE_TIMEOUT` | `30s` / `60s` | Inbound HTTP write/idle timeouts (set `SERVER_WRITE_TIMEOUT=0s` for WebSockets/SSE). |
 | `UPSTREAM_HEADER_TIMEOUT` / `UPSTREAM_REQUEST_TIMEOUT` | `15s` / `25s` | Outbound reverse-proxy timeouts (set `UPSTREAM_REQUEST_TIMEOUT=0s` for WebSockets/SSE). |
@@ -218,6 +224,8 @@ http:
 ---
 
 ## Benchmarks
+
+### Go Microbenchmarks
 
 Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 1.27 (`linux/amd64`, Intel Xeon 6985P-C):
 
@@ -231,7 +239,17 @@ Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 
 | `BenchmarkVerifyEdDSA` | `58.6 µs` | `8509 B` | `104` | Full Ed25519 (`EdDSA`) JWT verification + `CUSTOM_CLAIM_HEADERS` extraction |
 | `BenchmarkVerify/ES256` | `75.5 µs` | `5995 B` | `90` | Full ES256 (P-256) JWT signature + claims + RBAC verification |
 
-Run locally to reproduce on your hardware:
+### Live Head-to-Head Comparison
+
+Measured on the same machine (`linux/amd64`, Intel Xeon 6985P-C, `GOMAXPROCS=2`, 2048-bit RS256 Bearer JWT, local mock Keycloak JWKS & upstream, access logging disabled, 0 errors across all runs):
+
+| Proxy | Binary | `go.mod` Deps | Idle RAM | Reverse-Proxy (`C=32`) | Forward-Auth (`C=32`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **`gocloak-auth-proxy`** | **8.6 MB** | **8** | **9.1 MB** | **8,737 RPS** (`p50 3.36 ms`) | **15,825 RPS** (`p50 1.80 ms`) |
+| `GoGatekeeper v5.1.0` | 39 MB | 104 | 28.4 MB | 4,754 RPS (`p50 6.22 ms`) | 5,801 RPS (`p50 5.04 ms`) |
+| `oauth2-proxy v7.15.6` | 42 MB | 74 | 20.9 MB | 2,851 RPS (`p50 10.55 ms`) | 6,625 RPS (`p50 4.09 ms`) |
+
+Run locally to reproduce Go microbenchmarks on your hardware:
 
 ```sh
 make bench

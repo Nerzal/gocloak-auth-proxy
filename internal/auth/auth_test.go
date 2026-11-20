@@ -90,6 +90,7 @@ func TestVerify(t *testing.T) {
 			got, err := v.Verify(context.Background(), tok)
 			want := Identity{
 				User: "alice", Email: "alice@example.test",
+				Subject: "subject", ACR: "2",
 				Groups: []string{"one", "two"}, Roles: []string{"reader", "shared", "writer"},
 				RealmRoles: []string{"reader", "shared"}, ClientRoles: []string{"writer", "shared"},
 				RawToken: strings.TrimPrefix(tok, "Bearer "),
@@ -365,6 +366,7 @@ func TestExtendedAuthorizationAndAlgorithms(t *testing.T) {
 		{"missing group", Options{RequiredGroups: []string{"admins"}}},
 		{"missing scope", Options{RequiredScopes: []string{"api:write"}}},
 		{"wrong acr", Options{RequiredACR: []string{"3"}}},
+		{"missing amr", Options{RequiredAMR: []string{"mfa"}}},
 		{"wrong azp", Options{RequiredAZP: "other-client"}},
 		{"wrong org", Options{RequiredOrganization: "other-org"}},
 	} {

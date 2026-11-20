@@ -69,3 +69,52 @@ func TestClientConfigErrors(t *testing.T) {
 		t.Error("expected error for invalid PEM")
 	}
 }
+
+func TestClientConfigWithCert(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "test-client"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "client.crt")
+	keyPath := filepath.Join(dir, "client.key")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := ClientConfigWithCert("", certPath, keyPath)
+	if err != nil {
+		t.Fatalf("ClientConfigWithCert failed: %v", err)
+	}
+	if len(cfg.Certificates) != 1 || cfg.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("unexpected mTLS config: %+v", cfg)
+	}
+	if _, err := ClientConfigWithCert("", certPath, ""); err == nil {
+		t.Error("expected error when key is missing")
+	}
+	if _, err := ClientConfigWithCert("", "", keyPath); err == nil {
+		t.Error("expected error when cert is missing")
+	}
+	if _, err := ClientConfigWithCert("", filepath.Join(dir, "missing.crt"), keyPath); err == nil {
+		t.Error("expected error for missing cert file")
+	}
+}
