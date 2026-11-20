@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/tls"
@@ -51,6 +52,13 @@ type flight struct {
 	err  error
 }
 
+// Options configures optional JWKS cache dependencies.
+type Options struct {
+	Logger    *slog.Logger
+	TLSConfig *tls.Config
+	OnRefresh func(ok bool)
+}
+
 // Cache holds an immutable, atomically replaced set of public signing keys.
 type Cache struct {
 	baseURL         string
@@ -59,6 +67,7 @@ type Cache struct {
 	maxAge          time.Duration
 	transport       *boundedTransport
 	logger          *slog.Logger
+	onRefresh       func(ok bool)
 	current         atomic.Pointer[snapshot]
 	mu              sync.Mutex
 	inflight        *flight
@@ -66,10 +75,15 @@ type Cache struct {
 	lastOnDemandErr error
 }
 
-// New validates a Keycloak realm issuer. Plain HTTP is permitted only for
-// localhost and loopback IPs, for local development. The refresh interval must
-// be positive and no longer than 12 hours. A nil logger discards diagnostics.
+// New validates a Keycloak realm issuer with default TLS settings.
 func New(issuer string, refreshInterval time.Duration, logger *slog.Logger) (*Cache, error) {
+	return NewWithOptions(issuer, refreshInterval, Options{Logger: logger})
+}
+
+// NewWithOptions validates a Keycloak realm issuer and configures custom TLS
+// and refresh callbacks. Plain HTTP is permitted only for localhost and
+// loopback IPs, for local development.
+func NewWithOptions(issuer string, refreshInterval time.Duration, opts Options) (*Cache, error) {
 	if refreshInterval <= 0 || refreshInterval > maxSnapshotAge/2 {
 		return nil, errors.New("JWKS refresh interval must be between zero and 12 hours")
 	}
@@ -98,6 +112,15 @@ func New(issuer string, refreshInterval time.Duration, logger *slog.Logger) (*Ca
 	u.Path = strings.Join(parts[:len(parts)-2], "/")
 	base := strings.TrimRight(u.String(), "/")
 	certURL := issuer + "/protocol/openid-connect/certs"
+	tlsCfg := opts.TLSConfig
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		tlsCfg = tlsCfg.Clone()
+		if tlsCfg.MinVersion < tls.VersionTLS12 {
+			tlsCfg.MinVersion = tls.VersionTLS12
+		}
+	}
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -108,8 +131,9 @@ func New(issuer string, refreshInterval time.Duration, logger *slog.Logger) (*Ca
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: fetchTimeout,
 		ExpectContinueTimeout: time.Second,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSClientConfig:       tlsCfg,
 	}
+	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
@@ -124,6 +148,7 @@ func New(issuer string, refreshInterval time.Duration, logger *slog.Logger) (*Ca
 		maxAge:    maxAge,
 		transport: &boundedTransport{base: transport, target: certURL},
 		logger:    logger,
+		onRefresh: opts.OnRefresh,
 	}, nil
 }
 
@@ -140,11 +165,19 @@ func (c *Cache) usable() *snapshot {
 	return s
 }
 
+func supportedAlgorithm(alg string) bool {
+	switch alg {
+	case "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA":
+		return true
+	}
+	return false
+}
+
 // Key returns an immutable public verification key when both kid and algorithm
 // match. Callers must treat the returned key as read-only. Unknown kids trigger
 // a coalesced, rate-limited refresh, including on the initial lookup.
 func (c *Cache) Key(ctx context.Context, kid, alg string) (any, error) {
-	if kid == "" || len(kid) > 256 || (alg != "RS256" && alg != "ES256") {
+	if kid == "" || len(kid) > 256 || !supportedAlgorithm(alg) {
 		return nil, errors.New("invalid key ID or unsupported signing algorithm")
 	}
 	if s := c.usable(); s != nil {
@@ -236,13 +269,22 @@ func (c *Cache) fetch(ctx context.Context) error {
 	}
 	certs, err := client.GetCerts(ctx, c.realm)
 	if err != nil {
+		if c.onRefresh != nil {
+			c.onRefresh(false)
+		}
 		return errors.New("JWKS refresh failed")
 	}
 	keys, err := parseKeys(certs.Keys)
 	if err != nil {
+		if c.onRefresh != nil {
+			c.onRefresh(false)
+		}
 		return err
 	}
 	c.current.Store(&snapshot{keys: keys, expires: time.Now().Add(c.maxAge)})
+	if c.onRefresh != nil {
+		c.onRefresh(true)
+	}
 	return nil
 }
 
@@ -363,8 +405,13 @@ func parseKey(raw gocloak.CertResponseKey) (string, signingKey, bool) {
 	}
 	switch value(raw.Kty) {
 	case "RSA":
-		if alg != "" && alg != "RS256" {
-			break
+		if alg == "" {
+			alg = "RS256"
+		}
+		switch alg {
+		case "RS256", "RS384", "RS512", "PS256", "PS384", "PS512":
+		default:
+			return "", signingKey{}, false
 		}
 		n, ok := decode(raw.N, 1024)
 		if !ok || n[0] == 0 {
@@ -379,25 +426,47 @@ func parseKey(raw gocloak.CertResponseKey) (string, signingKey, bool) {
 			!exponent.IsInt64() || exponent.Int64() < 3 || exponent.Int64() > 1<<31-1 || exponent.Bit(0) == 0 {
 			break
 		}
-		return kid, signingKey{"RS256", &rsa.PublicKey{N: modulus, E: int(exponent.Int64())}}, true
+		return kid, signingKey{alg, &rsa.PublicKey{N: modulus, E: int(exponent.Int64())}}, true
 	case "EC":
-		if (alg != "" && alg != "ES256") || value(raw.Crv) != "P-256" {
+		var curve elliptic.Curve
+		var coordSize int
+		var expectedAlg string
+		switch value(raw.Crv) {
+		case "P-256":
+			curve, coordSize, expectedAlg = elliptic.P256(), 32, "ES256"
+		case "P-384":
+			curve, coordSize, expectedAlg = elliptic.P384(), 48, "ES384"
+		case "P-521":
+			curve, coordSize, expectedAlg = elliptic.P521(), 66, "ES512"
+		default:
+			return "", signingKey{}, false
+		}
+		if alg != "" && alg != expectedAlg {
 			break
 		}
-		x, okX := decode(raw.X, 32)
-		y, okY := decode(raw.Y, 32)
-		if !okX || !okY || len(x) != 32 || len(y) != 32 {
+		x, okX := decode(raw.X, coordSize)
+		y, okY := decode(raw.Y, coordSize)
+		if !okX || !okY || len(x) != coordSize || len(y) != coordSize {
 			break
 		}
-		point := make([]byte, 65)
+		point := make([]byte, 1+2*coordSize)
 		point[0] = 4
-		copy(point[1:33], x)
-		copy(point[33:], y)
-		key, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), point)
+		copy(point[1:1+coordSize], x)
+		copy(point[1+coordSize:], y)
+		key, err := ecdsa.ParseUncompressedPublicKey(curve, point)
 		if err != nil {
 			break
 		}
-		return kid, signingKey{"ES256", key}, true
+		return kid, signingKey{expectedAlg, key}, true
+	case "OKP":
+		if value(raw.Crv) != "Ed25519" || (alg != "" && alg != "EdDSA") {
+			break
+		}
+		x, ok := decode(raw.X, ed25519.PublicKeySize)
+		if !ok || len(x) != ed25519.PublicKeySize {
+			break
+		}
+		return kid, signingKey{"EdDSA", ed25519.PublicKey(x)}, true
 	}
 	return "", signingKey{}, false
 }

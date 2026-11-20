@@ -59,6 +59,15 @@ func TestValidateRejectsInvalidConfiguration(t *testing.T) {
 		{"whitespace client id", func(c *Config) { c.ClientID = "  " }},
 		{"empty realm role", func(c *Config) { c.RequiredRealmRoles = []string{""} }},
 		{"empty client role", func(c *Config) { c.ClientID = "app"; c.RequiredClientRoles = []string{""} }},
+		{"invalid metrics addr", func(c *Config) { c.MetricsAddr = "9090" }},
+		{"tls cert without key", func(c *Config) { c.TLSCertFile = "/cert.pem" }},
+		{"introspection without secret", func(c *Config) { c.IntrospectionEnabled = true; c.ClientID = "app" }},
+		{"oidc without secret", func(c *Config) {
+			c.OIDCEnabled = true
+			c.ClientID = "app"
+			c.OIDCRedirectURL = "https://app.test/oauth2/callback"
+		}},
+		{"negative timeout", func(c *Config) { c.ServerWriteTimeout = -time.Second }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -68,5 +77,25 @@ func TestValidateRejectsInvalidConfiguration(t *testing.T) {
 				t.Fatal("expected invalid configuration")
 			}
 		})
+	}
+}
+
+func TestLoadExtendedOptions(t *testing.T) {
+	t.Setenv("ISSUER", "https://keycloak.example/realms/example")
+	t.Setenv("AUDIENCE", "service")
+	t.Setenv("ALLOWED_ALGORITHMS", "RS256,EdDSA")
+	t.Setenv("ROLE_MATCH_MODE", "any")
+	t.Setenv("GROUP_MATCH_MODE", "any")
+	t.Setenv("REQUIRED_GROUPS", "eng,ops")
+	t.Setenv("CUSTOM_CLAIM_HEADERS", "X-Tenant-ID=tenant_id")
+	t.Setenv("UPSTREAM_REQUEST_TIMEOUT", "0s")
+	t.Setenv("METRICS_ADDR", ":9090")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.RequireAnyRole || !c.RequireAnyGroup || !c.DisableUpstreamTimeout ||
+		c.CustomClaimHeaders["X-Tenant-ID"] != "tenant_id" || c.MetricsAddr != ":9090" || len(c.AllowedAlgorithms) != 2 {
+		t.Fatalf("unexpected extended config: %+v", c)
 	}
 }

@@ -13,28 +13,52 @@ Configure the process with environment variables:
 | `AUDIENCE` | Required. Expected token audience. |
 | `UPSTREAM_URL` | Optional. Upstream URL; when omitted, run in forward-auth mode. |
 | `LISTEN_ADDR` | Listen address; default `:8080`. |
-| `CLIENT_ID` | Keycloak client ID; required when `REQUIRED_CLIENT_ROLES` is set. |
+| `CLIENT_ID` | Keycloak client ID; required for client roles, introspection, or OIDC SSO. |
+| `CLIENT_SECRET` | Keycloak client secret; required for `INTROSPECTION_ENABLED` and confidential OIDC clients. |
+| `ALLOWED_ALGORITHMS` | Comma-separated allowed JWS algorithms; default `RS256,ES256` (supports `RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `EdDSA`). |
 | `REQUIRED_REALM_ROLES` | Comma-separated required realm roles. |
 | `REQUIRED_CLIENT_ROLES` | Comma-separated required roles for `CLIENT_ID`. |
+| `ROLE_MATCH_MODE` | Role matching mode: `all` (default) or `any`. |
+| `REQUIRED_GROUPS` | Comma-separated required groups; controlled by `GROUP_MATCH_MODE` (`all` default or `any`). |
+| `REQUIRED_SCOPES` | Comma-separated required OAuth scopes (checked against `scope` claim). |
+| `REQUIRED_ACR` | Comma-separated accepted `acr` (Authentication Context Class Reference / MFA level) values. |
+| `REQUIRE_EMAIL_VERIFIED` | Require `email_verified: true`; default `false`. |
+| `REQUIRED_AZP` | Require exact `azp` (authorized party) claim match. |
+| `REQUIRED_ORGANIZATION` | Require Keycloak 26+ `organization` claim membership. |
 | `HEADER_USER` | Optional. Identity header name for the verified username/subject; default `X-Auth-Request-User`. |
 | `HEADER_EMAIL` | Optional. Identity header name for the verified email; default `X-Auth-Request-Email`. |
 | `HEADER_GROUPS` | Optional. Identity header name for verified groups; default `X-Auth-Request-Groups`. |
 | `HEADER_ROLES` | Optional. Identity header name for verified roles; default `X-Auth-Request-Roles`. |
+| `CUSTOM_CLAIM_HEADERS` | Comma-separated `Header-Name=claim_name` mappings forwarded from verified JWT claims. |
+| `PASS_ACCESS_TOKEN` | Forward verified access token (`Authorization` in reverse-proxy, `X-Auth-Request-Access-Token` in forward-auth); default `false`. |
 | `JWKS_REFRESH_INTERVAL` | JWKS refresh interval as a Go duration; default `5m`, allowed `1s`–`12h`. |
 | `CLOCK_SKEW` | Token validation clock tolerance as a Go duration; default `30s`, allowed `0s`–`30s`. |
+| `KEYCLOAK_CA_FILE` | Optional PEM CA bundle for TLS connections to Keycloak. |
+| `UPSTREAM_CA_FILE` | Optional PEM CA bundle for TLS connections to the reverse-proxy upstream. |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | Optional TLS 1.2+ certificate and key for the proxy listener. |
+| `METRICS_ADDR` | Optional dedicated listen address for Prometheus `/metrics` (e.g. `:9090`); disabled by default. |
+| `LOG_LEVEL` | Structured JSON log level: `debug`, `info` (default), `warn`, `error`. |
+| `SERVER_WRITE_TIMEOUT` / `UPSTREAM_REQUEST_TIMEOUT` | Server write timeout (default `30s`) and upstream request timeout (default `25s`); set to `0s` for WebSockets/SSE streaming. |
+| `INTROSPECTION_ENABLED` | Enable online Keycloak token introspection (`INTROSPECTION_CACHE_TTL` default `15s`, max `5m`). |
+| `UMA_ENABLED` | Enable Keycloak UMA 2.0 resource authorization (`UMA_METHOD_SCOPE=true` sends `#method:<HTTP_METHOD>`). |
+| `PUBLIC_PATHS` / `OPTIONAL_AUTH_PATHS` | Comma-separated path patterns (`/public/*`, `/status`) for public or optional-auth routes. |
+| `ALLOW_CORS_PREFLIGHT` | Allow CORS `OPTIONS` preflight requests without authentication; default `false`. |
+| `ROUTE_RULES` | Semicolon-separated route ACLs, e.g. `POST:/admin/*=realm:admin,client:writer`. |
+| `OIDC_ENABLED` | Enable Browser SSO (Authorization Code + PKCE, AES-256-GCM chunked cookies, auto-refresh, `/oauth2/start`, `/oauth2/callback`, `/oauth2/logout`). |
+| `OIDC_REDIRECT_URL` / `OIDC_COOKIE_SECRET` | Required when `OIDC_ENABLED=true` (`OIDC_COOKIE_SECRET` min 32 chars). Optional: `OIDC_POST_LOGOUT_URL`, `OIDC_COOKIE_NAME`, `OIDC_COOKIE_SECURE` (`true`), `OIDC_COOKIE_SAMESITE` (`lax`), `OIDC_SCOPES`, `OIDC_SESSION_MAX_AGE` (`24h`), `OIDC_REDIRECT` (`true`). |
 
-All configured roles are required. Tokens must be access tokens (`typ: "Bearer"`)
-with valid `iss`, `aud`, `exp`, and `iat` claims (`nbf` is validated when
-present; configure an Audience protocol mapper in Keycloak if your realm tokens
-do not include the target `AUDIENCE`). Do not send access tokens to untrusted
-services. Use HTTPS for the issuer in production, and terminate TLS at a trusted
-ingress. Restrict access to the proxy and upstream to trusted networks; do not
-allow clients to bypass the proxy. The service itself listens over HTTP.
+Tokens must be access tokens (`typ: "Bearer"`) with valid `iss`, `aud`, `exp`,
+and `iat` claims (`nbf` is validated when present; configure an Audience
+protocol mapper in Keycloak if your realm tokens do not include the target
+`AUDIENCE`). Do not send access tokens to untrusted services. Use HTTPS for the
+issuer in production, and terminate TLS at a trusted ingress or via
+`TLS_CERT_FILE`/`TLS_KEY_FILE`. Restrict access to the proxy and upstream to
+trusted networks; do not allow clients to bypass the proxy.
 
 `/healthz` and `/readyz` are unauthenticated health endpoints. Without an
 upstream, use `/auth` as the forward-auth endpoint. With `UPSTREAM_URL` set,
-other requests are reverse-proxied to that upstream (note that `/healthz` and
-`/readyz` are reserved by the proxy).
+other requests are reverse-proxied to that upstream (note that `/healthz`,
+`/readyz`, and `/oauth2/*` when `OIDC_ENABLED=true` are reserved by the proxy).
 
 ## Architecture and integration
 

@@ -12,7 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nerzal/gocloak-auth-proxy/internal/acl"
 	"github.com/Nerzal/gocloak-auth-proxy/internal/auth"
+	"github.com/Nerzal/gocloak-auth-proxy/internal/metrics"
 )
 
 type verifierFunc func(context.Context, string) (auth.Identity, error)
@@ -270,5 +272,118 @@ func BenchmarkForwardAuth(b *testing.B) {
 	for range b.N {
 		req.Header.Set("Authorization", "Bearer benchmark-token")
 		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+}
+
+type umaFunc func(context.Context, string, string, string) error
+
+func (f umaFunc) Authorize(ctx context.Context, rawToken, method, reqPath string) error {
+	return f(ctx, rawToken, method, reqPath)
+}
+
+type stubSession struct {
+	bearer   string
+	redirect bool
+}
+
+func (s stubSession) ResolveBearer(_ http.ResponseWriter, _ *http.Request) (string, bool) {
+	return s.bearer, s.bearer != ""
+}
+func (s stubSession) ShouldRedirect(_ *http.Request) bool { return s.redirect }
+func (s stubSession) RedirectToLogin(w http.ResponseWriter, _ *http.Request) {
+	http.Redirect(w, httptest.NewRequest("GET", "/", nil), "/oauth2/start", http.StatusFound)
+}
+
+func TestProxyExtendedFeatures(t *testing.T) {
+	policy, err := acl.New([]string{"/public/*"}, []string{"/optional/*"}, true, []string{"POST:/admin/*=realm:admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := metrics.New()
+	ver := verifierFunc(func(_ context.Context, _ string) (auth.Identity, error) {
+		return auth.Identity{
+			User:       "alice",
+			Email:      "alice@example.test",
+			Roles:      []string{"reader"},
+			RealmRoles: []string{"reader"},
+			Extra:      map[string]string{"X-Tenant-ID": "t-1"},
+			RawToken:   "verified-jwt",
+		}, nil
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Echo-User", r.Header.Get("X-Auth-Request-User"))
+		w.Header().Set("Echo-Tenant", r.Header.Get("X-Tenant-ID"))
+		w.Header().Set("Echo-Auth", r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	h, err := NewReverseProxyWithOptions(ver, upstream.URL, Options{
+		ExtraHeaders:    []string{"X-Tenant-ID"},
+		PassAccessToken: true,
+		ACL:             policy,
+		UMA: umaFunc(func(_ context.Context, _, _, p string) error {
+			if p == "/uma-denied" {
+				return auth.ErrForbidden
+			}
+			return nil
+		}),
+		Session: stubSession{redirect: true},
+		Metrics: reg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Public path bypasses auth and scrubs spoofed custom header.
+	pubReq := httptest.NewRequest(http.MethodGet, "http://proxy.test/public/doc", nil)
+	pubReq.Header.Set("X-Tenant-ID", "spoofed")
+	pubRec := httptest.NewRecorder()
+	h.ServeHTTP(pubRec, pubReq)
+	if pubRec.Code != http.StatusOK || pubRec.Header().Get("Echo-Tenant") != "" || pubRec.Header().Get("Echo-User") != "" {
+		t.Fatalf("public path failed: %d %#v", pubRec.Code, pubRec.Header())
+	}
+
+	// 2. Optional path without token allows anonymous.
+	optRec := httptest.NewRecorder()
+	h.ServeHTTP(optRec, httptest.NewRequest(http.MethodGet, "http://proxy.test/optional/feed", nil))
+	if optRec.Code != http.StatusOK || optRec.Header().Get("Echo-User") != "" {
+		t.Fatalf("optional anonymous failed: %d", optRec.Code)
+	}
+
+	// 3. Authenticated request injects custom header and passes access token.
+	authReq := httptest.NewRequest(http.MethodGet, "http://proxy.test/private", nil)
+	authReq.Header.Set("Authorization", "Bearer verified-jwt")
+	authReq.Header["X_Tenant_ID"] = []string{"spoofed"}
+	authRec := httptest.NewRecorder()
+	h.ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusOK || authRec.Header().Get("Echo-Tenant") != "t-1" || authRec.Header().Get("Echo-Auth") != "Bearer verified-jwt" {
+		t.Fatalf("authenticated request failed: %d %#v", authRec.Code, authRec.Header())
+	}
+
+	// 4. Route ACL denies POST /admin/x for reader.
+	aclReq := httptest.NewRequest(http.MethodPost, "http://proxy.test/admin/x", nil)
+	aclReq.Header.Set("Authorization", "Bearer verified-jwt")
+	aclRec := httptest.NewRecorder()
+	h.ServeHTTP(aclRec, aclReq)
+	if aclRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 from route ACL, got %d", aclRec.Code)
+	}
+
+	// 5. UMA denies /uma-denied.
+	umaReq := httptest.NewRequest(http.MethodGet, "http://proxy.test/uma-denied", nil)
+	umaReq.Header.Set("Authorization", "Bearer verified-jwt")
+	umaRec := httptest.NewRecorder()
+	h.ServeHTTP(umaRec, umaReq)
+	if umaRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 from UMA, got %d", umaRec.Code)
+	}
+
+	// 6. Unauthenticated browser request redirects to OIDC login.
+	redirRec := httptest.NewRecorder()
+	h.ServeHTTP(redirRec, httptest.NewRequest(http.MethodGet, "http://proxy.test/dashboard", nil))
+	if redirRec.Code != http.StatusFound || redirRec.Header().Get("Location") != "/oauth2/start" {
+		t.Fatalf("expected 302 to /oauth2/start, got %d %q", redirRec.Code, redirRec.Header().Get("Location"))
 	}
 }
