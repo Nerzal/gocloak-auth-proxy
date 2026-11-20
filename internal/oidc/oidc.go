@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Nerzal/gocloak-auth-proxy/internal/auth"
 	"github.com/Nerzal/gocloak-auth-proxy/internal/keycloak"
@@ -76,10 +77,11 @@ type authState struct {
 }
 
 type sessionData struct {
-	AccessToken  string `json:"a"`
-	RefreshToken string `json:"r,omitempty"`
-	IDToken      string `json:"i,omitempty"`
-	ExpiresAt    int64  `json:"e"`
+	AccessToken      string `json:"a"`
+	RefreshToken     string `json:"r,omitempty"`
+	IDToken          string `json:"i,omitempty"`
+	ExpiresAt        int64  `json:"e"`
+	SessionExpiresAt int64  `json:"se"`
 }
 
 type refreshFlight struct {
@@ -236,6 +238,16 @@ func (m *Manager) StripCookies(headers http.Header) {
 	}
 	rawCookies := headers.Values("Cookie")
 	if len(rawCookies) == 0 {
+		return
+	}
+	hasOwn := false
+	for _, line := range rawCookies {
+		if strings.Contains(line, m.cookieName) {
+			hasOwn = true
+			break
+		}
+	}
+	if !hasOwn {
 		return
 	}
 	var kept []string
@@ -453,7 +465,7 @@ func (m *Manager) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if sess.IDToken != "" && !verifyIDTokenNonce(sess.IDToken, st.Nonce) {
+	if sess.IDToken != "" && !m.verifyIDToken(sess.IDToken, st.Nonce) {
 		m.record("error")
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -476,7 +488,7 @@ func (m *Manager) handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, safeRedirectPath(st.Redirect), http.StatusFound)
 }
 
-func verifyIDTokenNonce(idToken, expectedNonce string) bool {
+func (m *Manager) verifyIDToken(idToken, expectedNonce string) bool {
 	if expectedNonce == "" {
 		return false
 	}
@@ -489,12 +501,43 @@ func verifyIDTokenNonce(idToken, expectedNonce string) bool {
 		return false
 	}
 	var claims struct {
-		Nonce string `json:"nonce"`
+		Issuer   string          `json:"iss"`
+		Audience json.RawMessage `json:"aud"`
+		Exp      int64           `json:"exp"`
+		Nonce    string          `json:"nonce"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil || claims.Nonce == "" {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(expectedNonce)) == 1
+	if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(expectedNonce)) != 1 {
+		return false
+	}
+	if claims.Issuer != m.issuer || claims.Exp <= time.Now().Unix() {
+		return false
+	}
+	if !audienceContains(claims.Audience, m.clientID) {
+		return false
+	}
+	return true
+}
+
+func audienceContains(raw json.RawMessage, target string) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var single string
+	if raw[0] == '"' && json.Unmarshal(raw, &single) == nil {
+		return single == target
+	}
+	var list []string
+	if raw[0] == '[' && json.Unmarshal(raw, &list) == nil {
+		for _, item := range list {
+			if item == target {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *Manager) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -577,10 +620,11 @@ func (m *Manager) exchangeCode(ctx context.Context, code, codeVerifier string) (
 		exp = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return sessionData{
-		AccessToken:  tok.AccessToken,
-		RefreshToken: tok.RefreshToken,
-		IDToken:      tok.IDToken,
-		ExpiresAt:    exp,
+		AccessToken:      tok.AccessToken,
+		RefreshToken:     tok.RefreshToken,
+		IDToken:          tok.IDToken,
+		ExpiresAt:        exp,
+		SessionExpiresAt: time.Now().Add(m.sessionMaxAge).Unix(),
 	}, nil
 }
 
@@ -604,10 +648,11 @@ func (m *Manager) refresh(ctx context.Context, prev sessionData) (sessionData, e
 		exp = time.Now().Add(time.Duration(jwtResp.ExpiresIn) * time.Second).Unix()
 	}
 	return sessionData{
-		AccessToken:  jwtResp.AccessToken,
-		RefreshToken: refreshTok,
-		IDToken:      idTok,
-		ExpiresAt:    exp,
+		AccessToken:      jwtResp.AccessToken,
+		RefreshToken:     refreshTok,
+		IDToken:          idTok,
+		ExpiresAt:        exp,
+		SessionExpiresAt: prev.SessionExpiresAt,
 	}, nil
 }
 
@@ -655,6 +700,9 @@ func (m *Manager) readSession(r *http.Request) (sessionData, bool) {
 	}
 	var sess sessionData
 	if err := m.openJSON(encoded, "session", &sess); err != nil {
+		return sessionData{}, false
+	}
+	if sess.SessionExpiresAt > 0 && time.Now().Unix() > sess.SessionExpiresAt {
 		return sessionData{}, false
 	}
 	return sess, true
@@ -744,8 +792,16 @@ func randomToken(n int) (string, error) {
 }
 
 func safeRedirectPath(rd string) string {
-	if rd == "" || !strings.HasPrefix(rd, "/") || strings.HasPrefix(rd, "//") || strings.HasPrefix(rd, "/\\") ||
-		strings.ContainsAny(rd, "\r\n\x00") {
+	if rd == "" || !strings.HasPrefix(rd, "/") || strings.HasPrefix(rd, "//") || strings.HasPrefix(rd, "/\\") {
+		return "/"
+	}
+	for _, r := range rd {
+		if unicode.IsControl(r) {
+			return "/"
+		}
+	}
+	u, err := url.Parse(rd)
+	if err != nil || u.Scheme != "" || u.Host != "" {
 		return "/"
 	}
 	return rd

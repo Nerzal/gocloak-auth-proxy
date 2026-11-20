@@ -143,6 +143,9 @@ func TestVerifyRejectsInvalidTokens(t *testing.T) {
 		{"no kid", nil, map[string]any{"kid": nil}},
 		{"critical extension", nil, map[string]any{"crit": []string{"example"}}},
 		{"b64 extension", nil, map[string]any{"b64": true}},
+		{"jku header", nil, map[string]any{"jku": "https://evil.test/jwks.json"}},
+		{"x5u header", nil, map[string]any{"x5u": "https://evil.test/cert.pem"}},
+		{"jwk header", nil, map[string]any{"jwk": map[string]any{"kty": "RSA"}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

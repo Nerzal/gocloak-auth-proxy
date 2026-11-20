@@ -118,8 +118,15 @@ type cacheEntry struct {
 	expires time.Time
 }
 
+type introspectFlight struct {
+	done   chan struct{}
+	active bool
+	err    error
+}
+
 // Introspector checks token active status against Keycloak's introspection
-// endpoint with a bounded, SHA-256-keyed short-lived cache.
+// endpoint with a bounded, SHA-256-keyed short-lived cache and singleflight
+// coalescing for concurrent lookups of the same token.
 type Introspector struct {
 	client       *gocloak.GoCloak
 	realm        string
@@ -128,8 +135,9 @@ type Introspector struct {
 	cacheTTL     time.Duration
 	onResult     func(result string)
 
-	mu      sync.RWMutex
-	entries map[[32]byte]cacheEntry
+	mu       sync.Mutex
+	entries  map[[32]byte]cacheEntry
+	inflight map[[32]byte]*introspectFlight
 }
 
 // NewIntrospector constructs an online token introspector.
@@ -152,6 +160,7 @@ func NewIntrospector(issuer, clientID, clientSecret string, cacheTTL time.Durati
 		cacheTTL:     cacheTTL,
 		onResult:     onResult,
 		entries:      make(map[[32]byte]cacheEntry),
+		inflight:     make(map[[32]byte]*introspectFlight),
 	}, nil
 }
 
@@ -159,39 +168,67 @@ func NewIntrospector(issuer, clientID, clientSecret string, cacheTTL time.Durati
 // Any network or protocol error fails closed (returns false, error).
 func (i *Introspector) Active(ctx context.Context, rawToken string) (bool, error) {
 	key := sha256.Sum256([]byte(rawToken))
+	i.mu.Lock()
 	if i.cacheTTL > 0 {
-		i.mu.RLock()
-		entry, ok := i.entries[key]
-		i.mu.RUnlock()
-		if ok && time.Now().Before(entry.expires) {
+		if entry, ok := i.entries[key]; ok && time.Now().Before(entry.expires) {
+			i.mu.Unlock()
 			i.record("cache_hit")
 			return entry.active, nil
 		}
 	}
+	if fl, ok := i.inflight[key]; ok {
+		i.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false, errors.New("token introspection canceled")
+		case <-fl.done:
+			return fl.active, fl.err
+		}
+	}
+	fl := &introspectFlight{done: make(chan struct{})}
+	i.inflight[key] = fl
+	i.mu.Unlock()
 
-	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
-	defer cancel()
-	res, err := i.client.RetrospectToken(reqCtx, rawToken, i.clientID, i.clientSecret, i.realm)
-	if err != nil || res == nil || res.Active == nil {
-		i.record("error")
-		return false, errors.New("token introspection failed")
+	fetchCtx := context.WithoutCancel(ctx)
+	go func() {
+		reqCtx, cancel := context.WithTimeout(fetchCtx, requestTimeout)
+		defer cancel()
+		res, err := i.client.RetrospectToken(reqCtx, rawToken, i.clientID, i.clientSecret, i.realm)
+		var active bool
+		var retErr error
+		if err != nil || res == nil || res.Active == nil {
+			i.record("error")
+			retErr = errors.New("token introspection failed")
+		} else {
+			active = *res.Active
+			if active {
+				i.record("active")
+			} else {
+				i.record("inactive")
+			}
+		}
+
+		i.mu.Lock()
+		fl.active = active
+		fl.err = retErr
+		delete(i.inflight, key)
+		if retErr == nil && i.cacheTTL > 0 {
+			i.storeLocked(key, active)
+		}
+		close(fl.done)
+		i.mu.Unlock()
+	}()
+
+	select {
+	case <-ctx.Done():
+		return false, errors.New("token introspection canceled")
+	case <-fl.done:
+		return fl.active, fl.err
 	}
-	active := *res.Active
-	if active {
-		i.record("active")
-	} else {
-		i.record("inactive")
-	}
-	if i.cacheTTL > 0 {
-		i.store(key, active)
-	}
-	return active, nil
 }
 
-func (i *Introspector) store(key [32]byte, active bool) {
+func (i *Introspector) storeLocked(key [32]byte, active bool) {
 	now := time.Now()
-	i.mu.Lock()
-	defer i.mu.Unlock()
 	if len(i.entries) >= maxIntrospectEntries {
 		for k, e := range i.entries {
 			if !now.Before(e.expires) {

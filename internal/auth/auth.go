@@ -271,12 +271,11 @@ func (v *Verifier) key(ctx context.Context, t *jwt.Token) (any, error) {
 	if !ok || kid == "" || len(kid) > 256 || !safeHeaderValue(kid) {
 		return nil, errInvalid
 	}
-	// No critical or unencoded-payload extensions are supported.
-	if _, ok := t.Header["crit"]; ok {
-		return nil, errInvalid
-	}
-	if _, ok := t.Header["b64"]; ok {
-		return nil, errInvalid
+	// No critical, unencoded-payload, or embedded/remote key extensions are supported.
+	for _, forbidden := range [5]string{"crit", "b64", "jku", "x5u", "jwk"} {
+		if _, ok := t.Header[forbidden]; ok {
+			return nil, errInvalid
+		}
 	}
 	alg := t.Method.Alg()
 	key, err := v.keys.Key(ctx, kid, alg)
@@ -389,25 +388,30 @@ func (v *Verifier) authorize(c claims, clientRoles []string) bool {
 }
 
 func extractCustomClaims(raw string, mapping map[string]string) (map[string]string, error) {
-	parts := strings.Split(raw, ".")
-	if len(parts) != 3 {
+	first := strings.IndexByte(raw, '.')
+	if first < 0 {
 		return nil, errInvalid
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	rest := raw[first+1:]
+	second := strings.IndexByte(rest, '.')
+	if second < 0 {
+		return nil, errInvalid
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(rest[:second])
 	if err != nil {
 		return nil, errInvalid
 	}
-	var rawClaims map[string]any
+	var rawClaims map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &rawClaims); err != nil {
 		return nil, errInvalid
 	}
 	extra := make(map[string]string, len(mapping))
 	for header, claimKey := range mapping {
-		val, ok := rawClaims[claimKey]
-		if !ok || val == nil {
+		rawVal, ok := rawClaims[claimKey]
+		if !ok || len(rawVal) == 0 || string(rawVal) == "null" {
 			continue
 		}
-		str, ok := stringifyClaim(val)
+		str, ok := decodeClaimValue(rawVal)
 		if !ok || !safeHeaderValue(str) {
 			return nil, errInvalid
 		}
@@ -416,7 +420,11 @@ func extractCustomClaims(raw string, mapping map[string]string) (map[string]stri
 	return extra, nil
 }
 
-func stringifyClaim(v any) (string, bool) {
+func decodeClaimValue(raw json.RawMessage) (string, bool) {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", false
+	}
 	switch t := v.(type) {
 	case string:
 		return t, true

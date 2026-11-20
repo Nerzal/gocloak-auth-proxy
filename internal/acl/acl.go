@@ -127,12 +127,12 @@ func parseRule(raw string) (Rule, error) {
 	}, nil
 }
 
-// NormalizePath cleans a URL path and rejects traversal attempts.
+// NormalizePath cleans a URL path and rejects traversal or delimiter injection attempts.
 func NormalizePath(rawPath string) (string, bool) {
 	if rawPath == "" {
 		return "/", true
 	}
-	if strings.Contains(rawPath, "..") || strings.ContainsAny(rawPath, "\x00\\") {
+	if strings.Contains(rawPath, "..") || strings.ContainsAny(rawPath, "\x00\\#") {
 		return "", false
 	}
 	cleaned := path.Clean(rawPath)
@@ -143,7 +143,7 @@ func NormalizePath(rawPath string) (string, bool) {
 }
 
 // NormalizeRequestPath validates both RawPath (rejecting encoded slashes,
-// dots, backslashes, or null bytes that cause proxy/upstream desyncs) and Path.
+// dots, backslashes, hashes, or null bytes that cause desyncs/injection) and Path.
 func NormalizeRequestPath(r *http.Request) (string, bool) {
 	if r == nil || r.URL == nil {
 		return "", false
@@ -151,7 +151,8 @@ func NormalizeRequestPath(r *http.Request) (string, bool) {
 	if raw := r.URL.RawPath; raw != "" {
 		lower := strings.ToLower(raw)
 		if strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") ||
-			strings.Contains(lower, "%5c") || strings.Contains(lower, "%00") {
+			strings.Contains(lower, "%5c") || strings.Contains(lower, "%23") ||
+			strings.Contains(lower, "%00") {
 			return "", false
 		}
 	}

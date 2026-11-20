@@ -26,9 +26,14 @@ func (stubVerifier) Verify(_ context.Context, authorization string) (auth.Identi
 	return auth.Identity{User: "alice", RawToken: strings.TrimPrefix(authorization, "Bearer ")}, nil
 }
 
-func fakeIDTokenWithNonce(nonce string) string {
+func fakeIDTokenWithNonce(issuer, aud, nonce string) string {
 	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256"}`))
-	body, _ := json.Marshal(map[string]string{"nonce": nonce})
+	body, _ := json.Marshal(map[string]any{
+		"iss":   issuer,
+		"aud":   aud,
+		"exp":   time.Now().Add(time.Minute).Unix(),
+		"nonce": nonce,
+	})
 	pld := base64.RawURLEncoding.EncodeToString(body)
 	return hdr + "." + pld + ".sig"
 }
@@ -39,6 +44,7 @@ func TestOIDCFullFlowRefreshAndLogout(t *testing.T) {
 	var refreshedCount atomic.Int32
 	var logoutCalled atomic.Bool
 
+	var kcURL string
 	kc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/realms/demo/protocol/openid-connect/token":
@@ -58,7 +64,7 @@ func TestOIDCFullFlowRefreshAndLogout(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"access_token":  "initial-access-token",
 					"refresh_token": "refresh-1",
-					"id_token":      fakeIDTokenWithNonce(seenNonce),
+					"id_token":      fakeIDTokenWithNonce(kcURL+"/realms/demo", "my-app", seenNonce),
 					"expires_in":    1, // expires immediately to exercise auto-refresh
 				})
 			case "refresh_token":
@@ -78,6 +84,7 @@ func TestOIDCFullFlowRefreshAndLogout(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
+	kcURL = kc.URL
 	defer kc.Close()
 
 	mgr, err := New(Config{
@@ -213,11 +220,32 @@ func TestStripCookiesAndNonceRejection(t *testing.T) {
 		t.Fatalf("unexpected remaining cookies: %q", got)
 	}
 
-	if verifyIDTokenNonce(fakeIDTokenWithNonce("wrong"), "expected") {
+	if mgr.verifyIDToken(fakeIDTokenWithNonce("https://keycloak.example/realms/demo", "my-app", "wrong"), "expected") {
 		t.Error("accepted mismatched ID token nonce")
 	}
-	if !verifyIDTokenNonce(fakeIDTokenWithNonce("expected"), "expected") {
-		t.Error("rejected matching ID token nonce")
+	if mgr.verifyIDToken(fakeIDTokenWithNonce("https://other.example/realms/demo", "my-app", "expected"), "expected") {
+		t.Error("accepted mismatched ID token issuer")
+	}
+	if !mgr.verifyIDToken(fakeIDTokenWithNonce("https://keycloak.example/realms/demo", "my-app", "expected"), "expected") {
+		t.Error("rejected valid ID token")
+	}
+
+	// Expired absolute session cookie must be rejected even if access token is present.
+	rec := httptest.NewRecorder()
+	if err := mgr.writeSession(rec, sessionData{
+		AccessToken:      "tok",
+		SessionExpiresAt: time.Now().Add(-time.Minute).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	for _, c := range rec.Result().Cookies() {
+		if c.MaxAge > 0 {
+			req.AddCookie(c)
+		}
+	}
+	if _, ok := mgr.readSession(req); ok {
+		t.Error("accepted expired absolute session cookie")
 	}
 }
 

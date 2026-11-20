@@ -202,10 +202,11 @@ func validValue(value string) bool {
 }
 
 type verifiedPayload struct {
-	values   [4]string
-	extra    map[string]string
-	rawToken string
-	anon     bool
+	values    [4]string
+	extra     map[string]string
+	rawToken  string
+	cleanPath string
+	anon      bool
 }
 
 func identityValues(identity auth.Identity, extraNames []string) (verifiedPayload, bool) {
@@ -264,10 +265,13 @@ func inject(headers http.Header, names HeaderNames, payload verifiedPayload, pas
 	}
 }
 
-func securityHeaders(headers http.Header) {
+func securityHeaders(headers http.Header, isTLS bool) {
 	headers.Set("X-Content-Type-Options", "nosniff")
 	headers.Set("X-Frame-Options", "DENY")
 	headers.Set("Referrer-Policy", "no-referrer")
+	if isTLS {
+		headers.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+	}
 }
 
 func writeUnauthorized(w http.ResponseWriter) {
@@ -276,7 +280,7 @@ func writeUnauthorized(w http.ResponseWriter) {
 }
 
 func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, names HeaderNames, extra []string, opts Options, mode string) (verifiedPayload, bool) {
-	securityHeaders(w.Header())
+	securityHeaders(w.Header(), r.TLS != nil)
 	var cleanPath string
 	if opts.ACL != nil || opts.UMA != nil {
 		var pathOK bool
@@ -292,7 +296,7 @@ func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, nam
 	if authMode == acl.ModePublic {
 		scrubHeaders(r.Header, names, extra)
 		opts.Metrics.RecordRequest(mode, "public")
-		return verifiedPayload{anon: true}, true
+		return verifiedPayload{anon: true, cleanPath: cleanPath}, true
 	}
 
 	authHeaders := r.Header.Values("Authorization")
@@ -309,7 +313,7 @@ func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, nam
 		if bearer == "" {
 			if authMode == acl.ModeOptional {
 				opts.Metrics.RecordRequest(mode, "public")
-				return verifiedPayload{anon: true}, true
+				return verifiedPayload{anon: true, cleanPath: cleanPath}, true
 			}
 			opts.Metrics.RecordRequest(mode, "unauthorized")
 			if opts.Session != nil && opts.Session.ShouldRedirect(r) {
@@ -363,6 +367,7 @@ func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, nam
 		writeUnauthorized(w)
 		return verifiedPayload{}, false
 	}
+	payload.cleanPath = cleanPath
 	opts.Metrics.RecordRequest(mode, "allowed")
 	return payload, true
 }
@@ -494,12 +499,17 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 		BufferPool: &bufferPool{},
 		ErrorLog:   log.New(io.Discard, "", 0),
 		Rewrite: func(req *httputil.ProxyRequest) {
+			payload := req.In.Context().Value(identityKey{}).(verifiedPayload)
+			if payload.cleanPath != "" {
+				req.Out.URL.Path = payload.cleanPath
+				req.Out.URL.RawPath = ""
+			}
 			req.SetURL(target)
 			scrubHeaders(req.Out.Header, names, extra)
 			if opts.Session != nil {
 				opts.Session.StripCookies(req.Out.Header)
 			}
-			inject(req.Out.Header, names, req.In.Context().Value(identityKey{}).(verifiedPayload), opts.PassAccessToken, false)
+			inject(req.Out.Header, names, payload, opts.PassAccessToken, false)
 		},
 		ModifyResponse: func(response *http.Response) error {
 			// The handler has already set these headers on the client response.

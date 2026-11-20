@@ -97,7 +97,7 @@ func TestEncodedPathTraversalRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, raw := range []string{"/admin%2fsecret", "/public/%2e%2e/admin", "/public%5cadmin"} {
+	for _, raw := range []string{"/admin%2fsecret", "/public/%2e%2e/admin", "/public%5cadmin", "/api/public%23method:GET"} {
 		req := httptest.NewRequest(http.MethodGet, "http://proxy.test"+raw, nil)
 		if _, ok := p.AuthMode(req); ok {
 			t.Errorf("accepted encoded path %q", raw)

@@ -356,6 +356,12 @@ func (c Config) Validate() error {
 		if c.OIDCCookieSameSite == http.SameSiteNoneMode && !c.OIDCCookieSecure {
 			return errors.New("OIDC_COOKIE_SAMESITE=none requires OIDC_COOKIE_SECURE=true")
 		}
+		if c.OIDCPostLogoutURL != "" && !validPostLogoutURL(c.OIDCPostLogoutURL) {
+			return errors.New("OIDC_POST_LOGOUT_URL must be a safe relative path or absolute HTTP(S) URL")
+		}
+	}
+	if c.UpstreamURL == "" && (c.UMAEnabled || len(c.RouteRules) > 0) {
+		return errors.New("UMA_ENABLED and ROUTE_RULES require UPSTREAM_URL (reverse-proxy mode)")
 	}
 	for _, list := range [][]string{c.RequiredRealmRoles, c.RequiredClientRoles, c.RequiredGroups, c.RequiredScopes, c.RequiredACR} {
 		for _, item := range list {
@@ -365,6 +371,21 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validPostLogoutURL(value string) bool {
+	if strings.HasPrefix(value, "/") {
+		if strings.HasPrefix(value, "//") || strings.HasPrefix(value, "/\\") {
+			return false
+		}
+		for _, r := range value {
+			if r < 32 || r == 127 {
+				return false
+			}
+		}
+		return true
+	}
+	return validURL(value) == nil
 }
 
 func validURL(value string) error {
