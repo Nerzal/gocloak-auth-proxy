@@ -224,8 +224,9 @@ Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 
 | Benchmark | Time / Op | Bytes / Op | Allocs / Op | Scope |
 | --- | ---: | ---: | ---: | --- |
 | `BenchmarkPolicy` | `118.8 ns` | `0 B` | `0` | Path normalization + ACL mode + route role check |
+| `BenchmarkIntrospectorCacheHit` | `243.1 ns` | `0 B` | `0` | Parallel `RLock` introspection cache hit (SHA-256 token lookup) |
 | `BenchmarkForwardAuth` | `2.26 µs` | `2416 B` | `25` | Header scrubbing + identity injection (mock verifier + `httptest.ResponseRecorder`) |
-| `BenchmarkReadSession` | `4.72 µs` | `3921 B` | `8` | OIDC AES-256-GCM session cookie decryption & JSON decode |
+| `BenchmarkReadSession` | `4.26 µs` | `2761 B` | `6` | OIDC in-place AES-256-GCM session cookie decryption & JSON decode |
 | `BenchmarkVerify/RS256` | `37.5 µs` | `6379 B` | `79` | Full RS256 (2048-bit) JWT signature + claims + RBAC verification |
 | `BenchmarkVerifyEdDSA` | `58.6 µs` | `8509 B` | `104` | Full Ed25519 (`EdDSA`) JWT verification + `CUSTOM_CLAIM_HEADERS` extraction |
 | `BenchmarkVerify/ES256` | `75.5 µs` | `5995 B` | `90` | Full ES256 (P-256) JWT signature + claims + RBAC verification |

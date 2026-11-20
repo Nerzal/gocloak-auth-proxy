@@ -135,7 +135,7 @@ type Introspector struct {
 	cacheTTL     time.Duration
 	onResult     func(result string)
 
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	entries  map[[32]byte]cacheEntry
 	inflight map[[32]byte]*introspectFlight
 }
@@ -168,6 +168,16 @@ func NewIntrospector(issuer, clientID, clientSecret string, cacheTTL time.Durati
 // Any network or protocol error fails closed (returns false, error).
 func (i *Introspector) Active(ctx context.Context, rawToken string) (bool, error) {
 	key := sha256.Sum256([]byte(rawToken))
+	if i.cacheTTL > 0 {
+		i.mu.RLock()
+		entry, ok := i.entries[key]
+		i.mu.RUnlock()
+		if ok && time.Now().Before(entry.expires) {
+			i.record("cache_hit")
+			return entry.active, nil
+		}
+	}
+
 	i.mu.Lock()
 	if i.cacheTTL > 0 {
 		if entry, ok := i.entries[key]; ok && time.Now().Before(entry.expires) {

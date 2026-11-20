@@ -44,6 +44,11 @@ const (
 	defaultSessionMax    = 24 * time.Hour
 )
 
+var (
+	aadSession = []byte("session")
+	aadState   = []byte("state")
+)
+
 // TokenVerifier verifies a bearer authorization header value.
 type TokenVerifier interface {
 	Verify(ctx context.Context, authorization string) (auth.Identity, error)
@@ -412,7 +417,7 @@ func (m *Manager) handleStart(w http.ResponseWriter, r *http.Request) {
 		Redirect:     rd,
 		ExpiresAt:    time.Now().Add(stateCookieTTL).Unix(),
 	}
-	encoded, err := m.sealJSON(st, "state")
+	encoded, err := m.sealJSON(st, aadState)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -446,7 +451,7 @@ func (m *Manager) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var st authState
-	if err := m.openJSON(c.Value, "state", &st); err != nil || time.Now().Unix() > st.ExpiresAt {
+	if err := m.openJSON(c.Value, aadState, &st); err != nil || time.Now().Unix() > st.ExpiresAt {
 		m.record("error")
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -657,7 +662,7 @@ func (m *Manager) refresh(ctx context.Context, prev sessionData) (sessionData, e
 }
 
 func (m *Manager) writeSession(w http.ResponseWriter, sess sessionData) error {
-	encoded, err := m.sealJSON(sess, "session")
+	encoded, err := m.sealJSON(sess, aadSession)
 	if err != nil {
 		return err
 	}
@@ -699,7 +704,7 @@ func (m *Manager) readSession(r *http.Request) (sessionData, bool) {
 		encoded = b.String()
 	}
 	var sess sessionData
-	if err := m.openJSON(encoded, "session", &sess); err != nil {
+	if err := m.openJSON(encoded, aadSession, &sess); err != nil {
 		return sessionData{}, false
 	}
 	if sess.SessionExpiresAt > 0 && time.Now().Unix() > sess.SessionExpiresAt {
@@ -741,7 +746,7 @@ func (m *Manager) chunkName(index int) string {
 	return m.cookieName + "_" + strconv.Itoa(index)
 }
 
-func (m *Manager) sealJSON(v any, aad string) (string, error) {
+func (m *Manager) sealJSON(v any, aad []byte) (string, error) {
 	plain, err := json.Marshal(v)
 	if err != nil {
 		return "", err
@@ -750,18 +755,18 @@ func (m *Manager) sealJSON(v any, aad string) (string, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	sealed := m.aead.Seal(nonce, nonce, plain, []byte(aad))
+	sealed := m.aead.Seal(nonce, nonce, plain, aad)
 	return base64.RawURLEncoding.EncodeToString(sealed), nil
 }
 
-func (m *Manager) openJSON(encoded, aad string, dst any) error {
+func (m *Manager) openJSON(encoded string, aad []byte, dst any) error {
 	raw, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil || len(raw) < m.aead.NonceSize() {
 		return errors.New("invalid encrypted cookie")
 	}
 	nonce := raw[:m.aead.NonceSize()]
 	ciphertext := raw[m.aead.NonceSize():]
-	plain, err := m.aead.Open(nil, nonce, ciphertext, []byte(aad))
+	plain, err := m.aead.Open(ciphertext[:0], nonce, ciphertext, aad)
 	if err != nil {
 		return errors.New("cookie authentication failed")
 	}

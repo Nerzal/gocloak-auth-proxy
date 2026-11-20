@@ -90,3 +90,29 @@ func TestUMAAuthorizer(t *testing.T) {
 		t.Fatalf("expected ErrForbidden on UMA deny, got %v", err)
 	}
 }
+
+func BenchmarkIntrospectorCacheHit(b *testing.B) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"active": true})
+	}))
+	defer srv.Close()
+
+	intro, err := NewIntrospector(srv.URL+"/realms/demo", "client", "secret", time.Minute, nil, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if ok, err := intro.Active(context.Background(), "cached-token"); err != nil || !ok {
+		b.Fatalf("warmup failed: ok=%v err=%v", ok, err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if ok, err := intro.Active(context.Background(), "cached-token"); err != nil || !ok {
+				b.Errorf("Active failed: ok=%v err=%v", ok, err)
+				return
+			}
+		}
+	})
+}
