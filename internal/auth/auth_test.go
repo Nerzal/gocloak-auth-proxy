@@ -386,4 +386,51 @@ func TestExtendedAuthorizationAndAlgorithms(t *testing.T) {
 	}); err == nil {
 		t.Fatal("accepted HS256 in AllowedAlgorithms")
 	}
+
+	// Local RBAC failure short-circuits before online introspection.
+	introCalled := false
+	vSkipIntro, err := NewWithOptions(testKeys{key: edPub}, Options{
+		Issuer:             "issuer",
+		Audience:           "audience",
+		AllowedAlgorithms:  []string{"EdDSA"},
+		RequiredRealmRoles: []string{"superadmin"},
+		Introspector: introspectFunc(func(context.Context, string) (bool, error) {
+			introCalled = true
+			return true, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vSkipIntro.Verify(context.Background(), tok); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if introCalled {
+		t.Fatal("introspector should not be called when local RBAC rejects token")
+	}
+}
+
+func BenchmarkVerifyEdDSA(b *testing.B) {
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		b.Fatal(err)
+	}
+	v, err := NewWithOptions(testKeys{key: edPub}, Options{
+		Issuer:             "issuer",
+		Audience:           "audience",
+		AllowedAlgorithms:  []string{"EdDSA"},
+		RequiredRealmRoles: []string{"reader"},
+		CustomClaimHeaders: map[string]string{"X-Tenant-ID": "tenant_id"},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	token := signed(b, jwt.SigningMethodEdDSA, edPriv, validClaims(), nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := v.Verify(context.Background(), token); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

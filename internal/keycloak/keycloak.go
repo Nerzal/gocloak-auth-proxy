@@ -3,10 +3,13 @@
 package keycloak
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +23,7 @@ import (
 
 const (
 	requestTimeout       = 5 * time.Second
+	maxResponseBytes     = 1 << 20
 	maxIntrospectEntries = 10000
 )
 
@@ -45,7 +49,38 @@ func ParseIssuer(issuer string) (baseURL, realm string, err error) {
 	return strings.TrimRight(u.String(), "/"), realm, nil
 }
 
-func newTransport(tlsCfg *tls.Config) *http.Transport {
+type boundedTransport struct {
+	base     *http.Transport
+	maxBytes int64
+}
+
+func (t *boundedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	originalBody := resp.Body
+	defer func() { _ = originalBody.Close() }()
+	if resp.ContentLength > t.maxBytes {
+		return nil, errors.New("keycloak response too large")
+	}
+	body, err := io.ReadAll(io.LimitReader(originalBody, t.maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read keycloak response: %w", err)
+	}
+	if int64(len(body)) > t.maxBytes {
+		return nil, errors.New("keycloak response too large")
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, nil
+}
+
+// NewBoundedTransport returns a TLS 1.2+ HTTP RoundTripper that bounds
+// response bodies to maxBytes (defaulting to 1 MiB).
+func NewBoundedTransport(tlsCfg *tls.Config, maxBytes int64) http.RoundTripper {
+	if maxBytes <= 0 {
+		maxBytes = maxResponseBytes
+	}
 	if tlsCfg == nil {
 		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12}
 	} else {
@@ -54,7 +89,7 @@ func newTransport(tlsCfg *tls.Config) *http.Transport {
 			tlsCfg.MinVersion = tls.VersionTLS12
 		}
 	}
-	return &http.Transport{
+	base := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
@@ -66,9 +101,10 @@ func newTransport(tlsCfg *tls.Config) *http.Transport {
 		ExpectContinueTimeout: time.Second,
 		TLSClientConfig:       tlsCfg,
 	}
+	return &boundedTransport{base: base, maxBytes: maxBytes}
 }
 
-func newClient(baseURL string, transport *http.Transport) *gocloak.GoCloak {
+func newClient(baseURL string, transport http.RoundTripper) *gocloak.GoCloak {
 	client := gocloak.NewClient(baseURL)
 	client.RestyClient().SetTransport(transport)
 	client.RestyClient().GetClient().CheckRedirect = func(*http.Request, []*http.Request) error {
@@ -85,12 +121,11 @@ type cacheEntry struct {
 // Introspector checks token active status against Keycloak's introspection
 // endpoint with a bounded, SHA-256-keyed short-lived cache.
 type Introspector struct {
-	baseURL      string
+	client       *gocloak.GoCloak
 	realm        string
 	clientID     string
 	clientSecret string
 	cacheTTL     time.Duration
-	transport    *http.Transport
 	onResult     func(result string)
 
 	mu      sync.RWMutex
@@ -110,12 +145,11 @@ func NewIntrospector(issuer, clientID, clientSecret string, cacheTTL time.Durati
 		return nil, errors.New("introspection cache TTL must be between 0 and 5m")
 	}
 	return &Introspector{
-		baseURL:      baseURL,
+		client:       newClient(baseURL, NewBoundedTransport(tlsCfg, maxResponseBytes)),
 		realm:        realm,
 		clientID:     clientID,
 		clientSecret: clientSecret,
 		cacheTTL:     cacheTTL,
-		transport:    newTransport(tlsCfg),
 		onResult:     onResult,
 		entries:      make(map[[32]byte]cacheEntry),
 	}, nil
@@ -137,8 +171,7 @@ func (i *Introspector) Active(ctx context.Context, rawToken string) (bool, error
 
 	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	client := newClient(i.baseURL, i.transport)
-	res, err := client.RetrospectToken(reqCtx, rawToken, i.clientID, i.clientSecret, i.realm)
+	res, err := i.client.RetrospectToken(reqCtx, rawToken, i.clientID, i.clientSecret, i.realm)
 	if err != nil || res == nil || res.Active == nil {
 		i.record("error")
 		return false, errors.New("token introspection failed")
@@ -182,11 +215,10 @@ func (i *Introspector) record(result string) {
 // UMAAuthorizer enforces Keycloak Authorization Services (UMA 2.0) policies
 // per request URI and optional HTTP method scope.
 type UMAAuthorizer struct {
-	baseURL     string
+	client      *gocloak.GoCloak
 	realm       string
 	audience    string
 	methodScope bool
-	transport   *http.Transport
 	onResult    func(result string)
 }
 
@@ -200,11 +232,10 @@ func NewUMAAuthorizer(issuer, audience string, methodScope bool, tlsCfg *tls.Con
 		return nil, errors.New("UMA audience (CLIENT_ID or AUDIENCE) is required")
 	}
 	return &UMAAuthorizer{
-		baseURL:     baseURL,
+		client:      newClient(baseURL, NewBoundedTransport(tlsCfg, maxResponseBytes)),
 		realm:       realm,
 		audience:    audience,
 		methodScope: methodScope,
-		transport:   newTransport(tlsCfg),
 		onResult:    onResult,
 	}, nil
 }
@@ -222,8 +253,7 @@ func (u *UMAAuthorizer) Authorize(ctx context.Context, rawToken, method, reqPath
 	resFormat := "uri"
 	matchURI := true
 	aud := u.audience
-	client := newClient(u.baseURL, u.transport)
-	perms, err := client.GetRequestingPartyPermissions(reqCtx, rawToken, u.realm, gocloak.RequestingPartyTokenOptions{
+	perms, err := u.client.GetRequestingPartyPermissions(reqCtx, rawToken, u.realm, gocloak.RequestingPartyTokenOptions{
 		GrantType:                     &grantType,
 		Audience:                      &aud,
 		Permissions:                   []string{perm},

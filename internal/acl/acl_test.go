@@ -91,3 +91,40 @@ func TestInvalidPolicyConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestEncodedPathTraversalRejected(t *testing.T) {
+	p, err := New([]string{"/public/*"}, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"/admin%2fsecret", "/public/%2e%2e/admin", "/public%5cadmin"} {
+		req := httptest.NewRequest(http.MethodGet, "http://proxy.test"+raw, nil)
+		if _, ok := p.AuthMode(req); ok {
+			t.Errorf("accepted encoded path %q", raw)
+		}
+	}
+}
+
+func BenchmarkPolicy(b *testing.B) {
+	p, err := New([]string{"/public/*", "/status"}, []string{"/catalog/*"}, true, []string{
+		"POST:/admin/*=realm:admin,client:writer",
+		"/reports/*=realm:auditor",
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.test/admin/users", nil)
+	id := auth.Identity{User: "alice", RealmRoles: []string{"admin"}, ClientRoles: []string{"writer"}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		cleanPath, ok := NormalizeRequestPath(req)
+		if !ok {
+			b.Fatal("unexpected path rejection")
+		}
+		_ = p.AuthModeForPath(req, cleanPath)
+		if err := p.AuthorizePath(req.Method, cleanPath, id); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

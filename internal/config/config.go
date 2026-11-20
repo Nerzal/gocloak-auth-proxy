@@ -353,6 +353,9 @@ func (c Config) Validate() error {
 		if err := validURL(c.OIDCRedirectURL); err != nil {
 			return errors.New("OIDC_REDIRECT_URL must be an absolute HTTP(S) URL when OIDC_ENABLED=true")
 		}
+		if c.OIDCCookieSameSite == http.SameSiteNoneMode && !c.OIDCCookieSecure {
+			return errors.New("OIDC_COOKIE_SAMESITE=none requires OIDC_COOKIE_SECURE=true")
+		}
 	}
 	for _, list := range [][]string{c.RequiredRealmRoles, c.RequiredClientRoles, c.RequiredGroups, c.RequiredScopes, c.RequiredACR} {
 		for _, item := range list {

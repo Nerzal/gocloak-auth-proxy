@@ -142,6 +142,22 @@ func NormalizePath(rawPath string) (string, bool) {
 	return cleaned, true
 }
 
+// NormalizeRequestPath validates both RawPath (rejecting encoded slashes,
+// dots, backslashes, or null bytes that cause proxy/upstream desyncs) and Path.
+func NormalizeRequestPath(r *http.Request) (string, bool) {
+	if r == nil || r.URL == nil {
+		return "", false
+	}
+	if raw := r.URL.RawPath; raw != "" {
+		lower := strings.ToLower(raw)
+		if strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") ||
+			strings.Contains(lower, "%5c") || strings.Contains(lower, "%00") {
+			return "", false
+		}
+	}
+	return NormalizePath(r.URL.Path)
+}
+
 func matchPattern(pattern, reqPath string) bool {
 	if prefix, ok := strings.CutSuffix(pattern, "/*"); ok {
 		if prefix == "" {
@@ -154,28 +170,33 @@ func matchPattern(pattern, reqPath string) bool {
 
 // AuthMode returns whether the request is public, optional-auth, or requires authentication.
 func (p *Policy) AuthMode(r *http.Request) (Mode, bool) {
-	if p == nil {
-		return ModeRequired, true
-	}
-	cleanPath, ok := NormalizePath(r.URL.Path)
+	cleanPath, ok := NormalizeRequestPath(r)
 	if !ok {
 		return ModeRequired, false
 	}
+	return p.AuthModeForPath(r, cleanPath), true
+}
+
+// AuthModeForPath evaluates the auth mode using an already-normalized path.
+func (p *Policy) AuthModeForPath(r *http.Request, cleanPath string) Mode {
+	if p == nil {
+		return ModeRequired
+	}
 	if p.allowCORSPreflight && r.Method == http.MethodOptions &&
 		r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != "" {
-		return ModePublic, true
+		return ModePublic
 	}
 	for _, pat := range p.publicPaths {
 		if matchPattern(pat, cleanPath) {
-			return ModePublic, true
+			return ModePublic
 		}
 	}
 	for _, pat := range p.optionalPaths {
 		if matchPattern(pat, cleanPath) {
-			return ModeOptional, true
+			return ModeOptional
 		}
 	}
-	return ModeRequired, true
+	return ModeRequired
 }
 
 // Authorize checks route-specific role rules against a verified identity.
@@ -183,12 +204,20 @@ func (p *Policy) Authorize(r *http.Request, id auth.Identity) error {
 	if p == nil || len(p.rules) == 0 {
 		return nil
 	}
-	cleanPath, ok := NormalizePath(r.URL.Path)
+	cleanPath, ok := NormalizeRequestPath(r)
 	if !ok {
 		return auth.ErrForbidden
 	}
+	return p.AuthorizePath(r.Method, cleanPath, id)
+}
+
+// AuthorizePath checks route-specific role rules using an already-normalized path.
+func (p *Policy) AuthorizePath(method, cleanPath string, id auth.Identity) error {
+	if p == nil || len(p.rules) == 0 {
+		return nil
+	}
 	for _, rule := range p.rules {
-		if rule.Method != "" && rule.Method != r.Method {
+		if rule.Method != "" && rule.Method != method {
 			continue
 		}
 		if !matchPattern(rule.Pattern, cleanPath) {

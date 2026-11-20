@@ -192,6 +192,9 @@ func TestEndToEndOIDCBrowserSSOAndMetrics(t *testing.T) {
 	issuer := kc.URL + "/realms/demo"
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Cookie"), "gocloak_session") {
+			t.Errorf("OIDC session cookie leaked to upstream: %q", r.Header.Get("Cookie"))
+		}
 		_, _ = io.WriteString(w, "hello:"+r.Header.Get("X-Auth-Request-User"))
 	}))
 	defer upstream.Close()

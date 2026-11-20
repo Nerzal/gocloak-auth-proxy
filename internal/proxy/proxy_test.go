@@ -293,6 +293,7 @@ func (s stubSession) ShouldRedirect(_ *http.Request) bool { return s.redirect }
 func (s stubSession) RedirectToLogin(w http.ResponseWriter, _ *http.Request) {
 	http.Redirect(w, httptest.NewRequest("GET", "/", nil), "/oauth2/start", http.StatusFound)
 }
+func (s stubSession) StripCookies(headers http.Header) { headers.Del("Cookie") }
 
 func TestProxyExtendedFeatures(t *testing.T) {
 	policy, err := acl.New([]string{"/public/*"}, []string{"/optional/*"}, true, []string{"POST:/admin/*=realm:admin"})

@@ -44,6 +44,7 @@ type SessionResolver interface {
 	ResolveBearer(w http.ResponseWriter, r *http.Request) (string, bool)
 	ShouldRedirect(r *http.Request) bool
 	RedirectToLogin(w http.ResponseWriter, r *http.Request)
+	StripCookies(headers http.Header)
 }
 
 // HeaderNames controls where verified identity attributes are written.
@@ -154,7 +155,7 @@ func forbiddenHeader(name string) bool {
 		return true
 	}
 	switch name {
-	case "authorization", "proxy-authorization", "forwarded", "x-real-ip", "host", "connection", "proxy-connection",
+	case "authorization", "proxy-authorization", "forwarded", "x-real-ip", "x-auth-request-access-token", "host", "connection", "proxy-connection",
 		"keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "content-length",
 		"cookie", "set-cookie", "expect", "x-content-type-options", "x-frame-options", "referrer-policy":
 		return true
@@ -276,13 +277,18 @@ func writeUnauthorized(w http.ResponseWriter) {
 
 func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, names HeaderNames, extra []string, opts Options, mode string) (verifiedPayload, bool) {
 	securityHeaders(w.Header())
-	authMode, pathOK := opts.ACL.AuthMode(r)
-	if !pathOK {
-		scrubHeaders(r.Header, names, extra)
-		opts.Metrics.RecordRequest(mode, "forbidden")
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return verifiedPayload{}, false
+	var cleanPath string
+	if opts.ACL != nil || opts.UMA != nil {
+		var pathOK bool
+		cleanPath, pathOK = acl.NormalizeRequestPath(r)
+		if !pathOK {
+			scrubHeaders(r.Header, names, extra)
+			opts.Metrics.RecordRequest(mode, "forbidden")
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return verifiedPayload{}, false
+		}
 	}
+	authMode := opts.ACL.AuthModeForPath(r, cleanPath)
 	if authMode == acl.ModePublic {
 		scrubHeaders(r.Header, names, extra)
 		opts.Metrics.RecordRequest(mode, "public")
@@ -337,14 +343,13 @@ func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, nam
 		return verifiedPayload{}, false
 	}
 
-	if err := opts.ACL.Authorize(r, identity); err != nil {
+	if err := opts.ACL.AuthorizePath(r.Method, cleanPath, identity); err != nil {
 		opts.Metrics.RecordRequest(mode, "forbidden")
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return verifiedPayload{}, false
 	}
 
 	if opts.UMA != nil {
-		cleanPath, _ := acl.NormalizePath(r.URL.Path)
 		if err := opts.UMA.Authorize(r.Context(), identity.RawToken, r.Method, cleanPath); err != nil {
 			opts.Metrics.RecordRequest(mode, "forbidden")
 			http.Error(w, "Forbidden", http.StatusForbidden)
@@ -491,6 +496,9 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.SetURL(target)
 			scrubHeaders(req.Out.Header, names, extra)
+			if opts.Session != nil {
+				opts.Session.StripCookies(req.Out.Header)
+			}
 			inject(req.Out.Header, names, req.In.Context().Value(identityKey{}).(verifiedPayload), opts.PassAccessToken, false)
 		},
 		ModifyResponse: func(response *http.Response) error {

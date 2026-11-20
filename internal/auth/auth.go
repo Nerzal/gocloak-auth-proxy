@@ -54,23 +54,39 @@ type roleClaims struct {
 type orgClaim []string
 
 func (o *orgClaim) UnmarshalJSON(data []byte) error {
-	if string(data) == "null" {
+	i := 0
+	for i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\r' || data[i] == '\n') {
+		i++
+	}
+	if i == len(data) {
 		return nil
 	}
-	var single string
-	if err := json.Unmarshal(data, &single); err == nil {
+	switch data[i] {
+	case 'n':
+		if string(data[i:]) == "null" {
+			return nil
+		}
+	case '"':
+		var single string
+		if err := json.Unmarshal(data[i:], &single); err != nil {
+			return err
+		}
 		if single != "" {
 			*o = []string{single}
 		}
 		return nil
-	}
-	var list []string
-	if err := json.Unmarshal(data, &list); err == nil {
+	case '[':
+		var list []string
+		if err := json.Unmarshal(data[i:], &list); err != nil {
+			return err
+		}
 		*o = list
 		return nil
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err == nil {
+	case '{':
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(data[i:], &obj); err != nil {
+			return err
+		}
 		names := make([]string, 0, len(obj))
 		for k := range obj {
 			names = append(names, k)
@@ -237,15 +253,15 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Identity, 
 	if err != nil || token == nil || !token.Valid || c.IssuedAt == nil || c.Type != "Bearer" {
 		return Identity{}, errInvalid
 	}
+	id, err := v.identity(c, raw)
+	if err != nil {
+		return Identity{}, err
+	}
 	if v.introspector != nil {
 		active, err := v.introspector.Active(ctx, raw)
 		if err != nil || !active {
 			return Identity{}, errInvalid
 		}
-	}
-	id, err := v.identity(c, raw)
-	if err != nil {
-		return Identity{}, err
 	}
 	return id, nil
 }
