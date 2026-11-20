@@ -1,0 +1,20 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - depguard
+  settings:
+    depguard:
+      rules:
+        main:
+          list-mode: strict
+          files:
+            - $all
+          allow:
+            - $gostd
+            - github.com/Nerzal/gocloak-auth-proxy/
+            - github.com/Nerzal/gocloak/v14$
+            - github.com/Nerzal/gocloak/v14/
+            - github.com/golang-jwt/jwt/v5$
+            - github.com/golang-jwt/jwt/v5/
