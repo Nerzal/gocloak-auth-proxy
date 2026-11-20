@@ -79,7 +79,7 @@ type fileConfig struct {
 }
 
 func applyConfigFile(path string, c *Config) error {
-	// #nosec G304 -- CONFIG_FILE is explicitly configured by the operator at startup.
+	// #nosec G304,G703 -- CONFIG_FILE is explicitly configured by the operator at startup.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read CONFIG_FILE: %w", err)
