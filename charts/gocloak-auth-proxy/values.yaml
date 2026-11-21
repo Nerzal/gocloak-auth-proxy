@@ -83,6 +83,12 @@ podDisruptionBudget:
 
 terminationGracePeriodSeconds: 30
 
+probes:
+  scheme: HTTP # Set to HTTPS when TLS_CERT_FILE / TLS_KEY_FILE are mounted
+
+extraVolumes: []
+extraVolumeMounts: []
+
 nodeSelector: {}
 tolerations: []
 affinity: {}

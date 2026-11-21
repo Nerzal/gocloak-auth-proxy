@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -297,11 +298,17 @@ func Load() (Config, error) {
 
 func readSecretFile(path string) (string, error) {
 	// #nosec G304,G703 -- secret file paths are explicitly configured by the operator at startup.
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	if len(data) > 64<<10 {
+	defer func() { _ = f.Close() }()
+	const maxSecretFileBytes = 64 << 10
+	data, err := io.ReadAll(io.LimitReader(f, maxSecretFileBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxSecretFileBytes {
 		return "", errors.New("secret file exceeds 64 KiB limit")
 	}
 	return strings.TrimRight(string(data), "\r\n"), nil

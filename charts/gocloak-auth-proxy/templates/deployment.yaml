@@ -98,16 +98,26 @@ spec:
             httpGet:
               path: /healthz
               port: http
+              scheme: {{ .Values.probes.scheme | default "HTTP" }}
             initialDelaySeconds: 2
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
+              scheme: {{ .Values.probes.scheme | default "HTTP" }}
             initialDelaySeconds: 2
             periodSeconds: 5
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

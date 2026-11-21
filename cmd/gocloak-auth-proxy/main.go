@@ -140,6 +140,7 @@ type proxyRuntime struct {
 	handler   http.Handler
 	caches    []*jwks.Cache
 	drainable *health.Drainable
+	closers   []io.Closer
 }
 
 // buildHandler constructs the HTTP handler and primary JWKS cache for single-issuer callers and tests.
@@ -251,7 +252,10 @@ func buildRuntime(cfg config.Config, logger *slog.Logger, reg *metrics.Registry)
 		uma = umaAuth
 	}
 
-	var revStore oidc.RevocationStore
+	var (
+		revStore oidc.RevocationStore
+		closers  []io.Closer
+	)
 	if cfg.RedisAddr != "" {
 		var redisTLS *tls.Config
 		if cfg.RedisTLS || cfg.RedisCAFile != "" {
@@ -260,10 +264,12 @@ func buildRuntime(cfg config.Config, logger *slog.Logger, reg *metrics.Registry)
 				return nil, fmt.Errorf("invalid Redis TLS configuration: %w", err)
 			}
 		}
-		revStore, err = oidc.NewRedisRevocationStore(cfg.RedisAddr, cfg.RedisPassword, redisTLS)
+		rs, err := oidc.NewRedisRevocationStore(cfg.RedisAddr, cfg.RedisPassword, redisTLS)
 		if err != nil {
 			return nil, fmt.Errorf("invalid Redis configuration: %w", err)
 		}
+		revStore = rs
+		closers = append(closers, rs)
 	}
 
 	var oidcMgr *oidc.Manager
@@ -349,7 +355,14 @@ func buildRuntime(cfg config.Config, logger *slog.Logger, reg *metrics.Registry)
 		handler:   mux,
 		caches:    caches,
 		drainable: drainable,
+		closers:   closers,
 	}, nil
+}
+
+func (rt *proxyRuntime) close() {
+	for _, c := range rt.closers {
+		_ = c.Close()
+	}
 }
 
 func run() error {
@@ -489,6 +502,7 @@ func run() error {
 	<-shutdownDone
 	cacheWG.Wait()
 	<-metricsDone
+	rt.close()
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("HTTP server failed: %w", err)
 	}

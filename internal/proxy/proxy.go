@@ -385,7 +385,7 @@ func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, ext
 
 	identity, err := verifier.Verify(r.Context(), bearer)
 	if err != nil {
-		if opts.Logger != nil {
+		if opts.Logger != nil && opts.Logger.Enabled(r.Context(), slog.LevelDebug) {
 			opts.Logger.Debug("authentication rejected",
 				"mode", mode,
 				"reason", auth.Reason(err),
@@ -438,11 +438,15 @@ func NewForwardAuth(verifier Verifier, headers HeaderNames) (http.Handler, error
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
 }
 
 func (sr *statusRecorder) WriteHeader(code int) {
-	sr.status = code
+	if !sr.wroteHeader && (code < 100 || code >= 200 || code == http.StatusSwitchingProtocols) {
+		sr.status = code
+		sr.wroteHeader = true
+	}
 	sr.ResponseWriter.WriteHeader(code)
 }
 

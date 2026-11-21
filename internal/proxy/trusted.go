@@ -75,12 +75,15 @@ func extractTrustedForwarded(r *http.Request, trusted *trustedProxySet) (forward
 	if !ok {
 		return forwardedMeta{}, false
 	}
-	xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
-	if xff != "" && validValue(xff) {
-		xff = xff + ", " + addr.String()
-	} else {
-		xff = addr.String()
+	var xffParts []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		v = strings.TrimSpace(v)
+		if v != "" && validValue(v) {
+			xffParts = append(xffParts, v)
+		}
 	}
+	xffParts = append(xffParts, addr.String())
+	xff := strings.Join(xffParts, ", ")
 	proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
 	if proto != "http" && proto != "https" {
 		if r.TLS != nil {
