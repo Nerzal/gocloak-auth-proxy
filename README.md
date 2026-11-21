@@ -269,12 +269,12 @@ http:
 
 ### Go Microbenchmarks
 
-Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 1.27 (`linux/amd64`, Intel Xeon 6985P-C):
+Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 1.27.4 + `gocloak v15.1.0` (`linux/amd64`, Intel Xeon 6985P-C):
 
 | Benchmark | Time / Op | Bytes / Op | Allocs / Op | Scope |
 | --- | ---: | ---: | ---: | --- |
-| `BenchmarkPolicy` | `125.6 ns` | `0 B` | `0` | Path normalization + ACL mode + route role check |
-| `BenchmarkIntrospectorCacheHit` | `226.7 ns` | `0 B` | `0` | Parallel `RLock` introspection cache hit (SHA-256 token lookup) |
+| `BenchmarkPolicy` | `128.0 ns` | `0 B` | `0` | Path normalization + ACL mode + route role check |
+| `BenchmarkIntrospectorCacheHit` | `192.3 ns` | `0 B` | `0` | Parallel `RLock` introspection cache hit (SHA-256 token lookup) |
 | `BenchmarkVerifyCached` | `463.1 ns` | `0 B` | `0` | Parallel verified-token cache hit (SHA-256 + `exp`/`nbf` + JWKS key-identity check) |
 | `BenchmarkForwardAuth` | `1.62 µs` | `2336 B` | `17` | Header scrubbing + pre-canonicalized identity injection (`httptest.ResponseRecorder`) |
 | `BenchmarkReadSession` | `2.76 µs` | `1328 B` | `3` | OIDC pooled base64 + in-place AES-256-GCM decrypt + `encoding/json/v2` decode |
@@ -284,22 +284,54 @@ Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 
 
 ### Live Head-to-Head Cross-Language Comparison
 
-Measured with `make bench-compare` on the same machine (`linux/amd64`, Intel Xeon 6985P-C, `GOMAXPROCS=2`, `C=32`, `D=5s`, 2048-bit RS256 Bearer JWT, local mock Keycloak JWKS & upstream, 0 errors across all runs):
+Measured with `make bench-compare` on the same machine (`linux/amd64`, Intel Xeon 6985P-C, `GOMAXPROCS=2`, `C=32`, `D=5s`, 2048-bit RS256 Bearer JWT, `gocloak v15.1.0` with `SetDirectBodyRead()`, local mock Keycloak JWKS & upstream, 0 errors across all runs):
+
+#### Forward-Auth Throughput (RPS — higher is better)
+
+```mermaid
+xychart-beta horizontal
+    title "Forward-Auth Throughput (RPS, C=32, RS256 2048-bit)"
+    x-axis ["gocloak-auth-proxy (Warm)", "Rust Axum (Cold)", "gocloak-auth-proxy (Cold)", "Java 17 (Cold)", "oauth2-proxy v7.15 (Warm)", "Python Uvicorn (Cold)"]
+    y-axis "Requests / sec" 0 --> 28000
+    bar [25169, 21616, 15002, 6839, 6023, 5811]
+```
+
+#### Reverse-Proxy Throughput (RPS — higher is better)
+
+```mermaid
+xychart-beta horizontal
+    title "Reverse-Proxy Throughput (RPS, C=32, RS256 2048-bit)"
+    x-axis ["gocloak-auth-proxy (Warm)", "Rust Axum (Cold)", "gocloak-auth-proxy (Cold)", "oauth2-proxy v7.15 (Warm)", "Java 17 (Cold)", "Python Uvicorn (Cold)"]
+    y-axis "Requests / sec" 0 --> 12500
+    bar [11248, 10629, 7583, 2245, 1978, 734]
+```
+
+#### Memory Footprint Under Load (Reverse-Proxy Load RSS in MB — lower is better)
+
+```mermaid
+xychart-beta horizontal
+    title "Reverse-Proxy Memory Under Load (MB RSS, lower is better)"
+    x-axis ["Rust Axum", "gocloak-auth-proxy (Warm)", "gocloak-auth-proxy (Cold)", "oauth2-proxy v7.15", "Java 17"]
+    y-axis "RSS (MB)" 0 --> 120
+    bar [6, 16, 16, 28, 114]
+```
+
+#### Detailed Metrics
 
 | Proxy | Runtime | Mode | Token Mode | RPS | p50 | p95 | p99 | Idle / Load RSS |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| **`gocloak-auth-proxy` (Warm)** | **Go 1.27** | Forward-Auth | Warm | **30,797** | **0.82 ms** | **2.79 ms** | **4.18 ms** | **9.1 / 15.4 MB** |
-| **`gocloak-auth-proxy` (Cold)** | **Go 1.27** | Forward-Auth | Cold (2000) | **18,616** | **1.53 ms** | **4.08 ms** | **5.77 ms** | **9.0 / 15.9 MB** |
-| `rust-auth-proxy` (Axum + `jsonwebtoken`) | Rust 1.100 | Forward-Auth | Cold (2000) | 26,232 | 1.14 ms | 2.28 ms | 3.25 ms | 2.5 / 3.7 MB |
-| `java-auth-proxy` (`HttpServer`) | Java 17 | Forward-Auth | Cold (2000) | 8,876 | 3.16 ms | 7.59 ms | 12.51 ms | 38.2 / 104.4 MB |
-| `oauth2-proxy v7.15.6` | Go | Forward-Auth | Warm | 7,541 | 3.61 ms | 9.88 ms | 14.92 ms | 19.8 / 27.3 MB |
-| `python-auth-proxy` (Uvicorn + PyJWT) | Python 3.11 | Forward-Auth | Cold (2000) | 5,567 | 5.34 ms | 10.21 ms | 12.23 ms | 14.7 MB (master) |
-| **`gocloak-auth-proxy` (Warm)** | **Go 1.27** | Reverse-Proxy | Warm | **13,288** | **2.11 ms** | **5.02 ms** | **6.80 ms** | **9.1 / 16.3 MB** |
-| **`gocloak-auth-proxy` (Cold)** | **Go 1.27** | Reverse-Proxy | Cold (2000) | **9,922** | **2.91 ms** | **6.32 ms** | **8.44 ms** | **9.0 / 16.2 MB** |
-| `rust-auth-proxy` (Axum + `reqwest`) | Rust 1.100 | Reverse-Proxy | Cold (2000) | 12,385 | 2.42 ms | 4.41 ms | 5.55 ms | 2.4 / 6.1 MB |
-| `oauth2-proxy v7.15.6` | Go | Reverse-Proxy | Warm | 2,713 | 11.05 ms | 22.66 ms | 28.75 ms | 19.8 / 27.8 MB |
-| `java-auth-proxy` (`HttpClient`) | Java 17 | Reverse-Proxy | Cold (2000) | 1,421 | 20.01 ms | 41.15 ms | 50.29 ms | 37.8 / 112.2 MB |
-| `python-auth-proxy` (Uvicorn + `httpx`) | Python 3.11 | Reverse-Proxy | Cold (2000) | 837 | 17.18 ms | 129.99 ms | 210.00 ms | 14.7 MB (master) |
+| **`gocloak-auth-proxy` (Warm)** | **Go 1.27** | Forward-Auth | Warm | **25,169** | **1.08 ms** | **3.25 ms** | **4.60 ms** | **9.2 / 15.3 MB** |
+| `rust-auth-proxy` (Axum + `jsonwebtoken`) | Rust 1.100 | Forward-Auth | Cold (2000) | 21,616 | 1.32 ms | 2.95 ms | 4.31 ms | 2.6 / 3.8 MB |
+| **`gocloak-auth-proxy` (Cold)** | **Go 1.27** | Forward-Auth | Cold (2000) | **15,002** | **1.99 ms** | **4.78 ms** | **6.45 ms** | **9.2 / 15.7 MB** |
+| `java-auth-proxy` (`HttpServer`) | Java 17 | Forward-Auth | Cold (2000) | 6,839 | 3.71 ms | 11.35 ms | 19.15 ms | 38.5 / 104.9 MB |
+| `oauth2-proxy v7.15.6` | Go | Forward-Auth | Warm | 6,023 | 4.47 ms | 12.39 ms | 18.93 ms | 19.8 / 26.7 MB |
+| `python-auth-proxy` (Uvicorn + PyJWT) | Python 3.11 | Forward-Auth | Cold (2000) | 5,811 | 5.14 ms | 8.06 ms | 10.88 ms | 14.7 MB (master) |
+| **`gocloak-auth-proxy` (Warm)** | **Go 1.27** | Reverse-Proxy | Warm | **11,248** | **2.51 ms** | **5.94 ms** | **7.82 ms** | **9.2 / 16.1 MB** |
+| `rust-auth-proxy` (Axum + `reqwest`) | Rust 1.100 | Reverse-Proxy | Cold (2000) | 10,629 | 2.86 ms | 4.95 ms | 6.63 ms | 2.4 / 6.3 MB |
+| **`gocloak-auth-proxy` (Cold)** | **Go 1.27** | Reverse-Proxy | Cold (2000) | **7,583** | **3.90 ms** | **7.89 ms** | **9.79 ms** | **9.2 / 16.2 MB** |
+| `oauth2-proxy v7.15.6` | Go | Reverse-Proxy | Warm | 2,245 | 13.39 ms | 26.98 ms | 33.67 ms | 19.9 / 27.8 MB |
+| `java-auth-proxy` (`HttpClient`) | Java 17 | Reverse-Proxy | Cold (2000) | 1,978 | 14.23 ms | 29.00 ms | 35.59 ms | 38.1 / 114.4 MB |
+| `python-auth-proxy` (Uvicorn + `httpx`) | Python 3.11 | Reverse-Proxy | Cold (2000) | 734 | 32.95 ms | 108.97 ms | 169.99 ms | 14.7 MB (master) |
 
 ### Running Benchmarks & Profiles Locally
 
