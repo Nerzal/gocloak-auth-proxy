@@ -260,7 +260,7 @@ func (c *Cache) refresh(ctx context.Context, onDemand bool) error {
 func (c *Cache) fetch(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
-	client := gocloak.NewClient(c.baseURL)
+	client := gocloak.NewClient(c.baseURL, gocloak.SetDirectBodyRead())
 	// GetCerts otherwise retains a per-client cache and timer for ten minutes.
 	client.Config.CertsInvalidateTime = 0
 	client.RestyClient().SetTransport(c.transport)

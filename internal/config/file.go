@@ -1,8 +1,7 @@
 package config
 
 import (
-	"bytes"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -39,6 +38,7 @@ type fileConfig struct {
 	RequiredOrganization *string           `json:"required_organization"`
 	JWKSRefreshInterval  *string           `json:"jwks_refresh_interval"`
 	ClockSkew            *string           `json:"clock_skew"`
+	TokenCacheSize       *int              `json:"token_cache_size"`
 
 	KeycloakCAFile          *string `json:"keycloak_ca_file"`
 	KeycloakClientCertFile  *string `json:"keycloak_client_cert_file"`
@@ -84,11 +84,15 @@ func applyConfigFile(path string, c *Config) error {
 	if err != nil {
 		return fmt.Errorf("read CONFIG_FILE: %w", err)
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	var fc fileConfig
-	if err := dec.Decode(&fc); err != nil {
+	if err := json.Unmarshal(data, &fc, json.RejectUnknownMembers(true)); err != nil {
 		return fmt.Errorf("parse CONFIG_FILE: %w", err)
+	}
+	if fc.TokenCacheSize != nil {
+		if *fc.TokenCacheSize < 0 || *fc.TokenCacheSize > 100000 {
+			return errors.New("token_cache_size in CONFIG_FILE must be between 0 and 100000")
+		}
+		c.TokenCacheSize = *fc.TokenCacheSize
 	}
 	setStr := func(dst *string, src *string) {
 		if src != nil {

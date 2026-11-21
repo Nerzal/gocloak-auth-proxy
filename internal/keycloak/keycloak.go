@@ -93,8 +93,8 @@ func NewBoundedTransport(tlsCfg *tls.Config, maxBytes int64) http.RoundTripper {
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          20,
-		MaxIdleConnsPerHost:   20,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   128,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: requestTimeout,
@@ -105,7 +105,7 @@ func NewBoundedTransport(tlsCfg *tls.Config, maxBytes int64) http.RoundTripper {
 }
 
 func newClient(baseURL string, transport http.RoundTripper) *gocloak.GoCloak {
-	client := gocloak.NewClient(baseURL)
+	client := gocloak.NewClient(baseURL, gocloak.SetDirectBodyRead())
 	client.RestyClient().SetTransport(transport)
 	client.RestyClient().GetClient().CheckRedirect = func(*http.Request, []*http.Request) error {
 		return errors.New("redirects are not allowed")

@@ -1,9 +1,9 @@
 module github.com/Nerzal/gocloak-auth-proxy
 
-go 1.26.0
+go 1.27.0
 
 require (
-	github.com/Nerzal/gocloak/v15 v15.0.0
+	github.com/Nerzal/gocloak/v15 v15.1.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 )
 

@@ -214,7 +214,7 @@ func New(cfg Config, verifier TokenVerifier) (*Manager, error) {
 			return errors.New("redirects are not allowed on token endpoint")
 		},
 	}
-	kcClient := gocloak.NewClient(baseURL)
+	kcClient := gocloak.NewClient(baseURL, gocloak.SetDirectBodyRead())
 	kcClient.RestyClient().SetTransport(transport)
 	kcClient.RestyClient().GetClient().CheckRedirect = func(*http.Request, []*http.Request) error {
 		return errors.New("redirects are not allowed")
@@ -747,23 +747,67 @@ func (m *Manager) writeSession(w http.ResponseWriter, sess sessionData) error {
 	return nil
 }
 
+type cookieDecodeBuf struct {
+	raw []byte
+	buf []byte
+}
+
+var cookieBufPool = sync.Pool{
+	New: func() any {
+		return &cookieDecodeBuf{
+			raw: make([]byte, 0, 4096),
+			buf: make([]byte, 0, 4096),
+		}
+	},
+}
+
+// lookupCookieValue scans Cookie headers without allocating []*http.Cookie.
+func lookupCookieValue(headers http.Header, name string) (string, bool) {
+	for _, line := range headers["Cookie"] {
+		for len(line) > 0 {
+			var part string
+			if idx := strings.IndexByte(line, ';'); idx >= 0 {
+				part = line[:idx]
+				line = line[idx+1:]
+			} else {
+				part = line
+				line = ""
+			}
+			part = strings.TrimLeft(part, " \t")
+			eq := strings.IndexByte(part, '=')
+			if eq <= 0 {
+				continue
+			}
+			if part[:eq] != name {
+				continue
+			}
+			val := strings.TrimRight(part[eq+1:], " \t")
+			if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+				val = val[1 : len(val)-1]
+			}
+			return val, true
+		}
+	}
+	return "", false
+}
+
 func (m *Manager) readSession(r *http.Request) (sessionData, bool) {
-	c0, err := r.Cookie(m.cookieName)
-	if err != nil || c0.Value == "" {
+	c0Val, ok := lookupCookieValue(r.Header, m.cookieName)
+	if !ok || c0Val == "" {
 		return sessionData{}, false
 	}
-	encoded := c0.Value
-	if len(c0.Value) == maxCookieChunkSize {
+	encoded := c0Val
+	if len(c0Val) == maxCookieChunkSize {
 		var b strings.Builder
 		b.Grow(maxCookieChunkSize * 2)
-		b.WriteString(c0.Value)
+		b.WriteString(c0Val)
 		for i := 1; i < maxCookieChunks; i++ {
-			c, err := r.Cookie(m.chunkName(i))
-			if err != nil || c.Value == "" {
+			v, ok := lookupCookieValue(r.Header, m.chunkName(i))
+			if !ok || v == "" {
 				break
 			}
-			b.WriteString(c.Value)
-			if len(c.Value) < maxCookieChunkSize {
+			b.WriteString(v)
+			if len(v) < maxCookieChunkSize {
 				break
 			}
 		}
@@ -827,10 +871,29 @@ func (m *Manager) sealJSON(v any, aad []byte) (string, error) {
 }
 
 func (m *Manager) openJSON(encoded string, aad []byte, dst any) error {
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil || len(raw) < m.aead.NonceSize() {
+	maxLen := base64.RawURLEncoding.DecodedLen(len(encoded))
+	if maxLen < m.aead.NonceSize() {
 		return errors.New("invalid encrypted cookie")
 	}
+	cb := cookieBufPool.Get().(*cookieDecodeBuf)
+	defer func() {
+		if cap(cb.raw) > 65536 {
+			cb.raw = make([]byte, 0, 4096)
+		}
+		if cap(cb.buf) > 65536 {
+			cb.buf = make([]byte, 0, 4096)
+		}
+		cookieBufPool.Put(cb)
+	}()
+	cb.raw = append(cb.raw[:0], encoded...)
+	if cap(cb.buf) < maxLen {
+		cb.buf = make([]byte, maxLen)
+	}
+	n, err := base64.RawURLEncoding.Decode(cb.buf[:maxLen], cb.raw)
+	if err != nil || n < m.aead.NonceSize() {
+		return errors.New("invalid encrypted cookie")
+	}
+	raw := cb.buf[:n]
 	nonce := raw[:m.aead.NonceSize()]
 	ciphertext := raw[m.aead.NonceSize():]
 	plain, err := m.aead.Open(ciphertext[:0], nonce, ciphertext, aad)

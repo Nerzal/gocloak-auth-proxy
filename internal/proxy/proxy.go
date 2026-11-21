@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"sync"
@@ -27,6 +28,17 @@ import (
 const (
 	defaultUpstreamHeaderTimeout  = 15 * time.Second
 	defaultUpstreamRequestTimeout = 25 * time.Second
+)
+
+// Pre-allocated read-only header value slices to eliminate per-request allocations.
+var (
+	hdrNoStore       = []string{"no-store"}
+	hdrVaryAuth      = []string{"Authorization"}
+	hdrNoSniff       = []string{"nosniff"}
+	hdrDeny          = []string{"DENY"}
+	hdrNoRef         = []string{"no-referrer"}
+	hdrHSTS          = []string{"max-age=31536000; includeSubDomains"}
+	hdrWWWAuthBearer = []string{"Bearer"}
 )
 
 // Verifier authenticates the incoming Authorization header.
@@ -69,30 +81,44 @@ type Options struct {
 	Metrics                *metrics.Registry
 }
 
-func (h HeaderNames) normalized(extra []string) (HeaderNames, []string, error) {
+type extraHeaderPair struct {
+	orig  string
+	canon string
+}
+
+func (h HeaderNames) normalized(extra []string) (HeaderNames, []extraHeaderPair, []string, error) {
 	names := []*string{&h.User, &h.Email, &h.Groups, &h.Roles}
 	defaults := []string{"X-Auth-Request-User", "X-Auth-Request-Email", "X-Auth-Request-Groups", "X-Auth-Request-Roles"}
 	seen := make(map[string]bool, len(names)+len(extra))
+	var customScrub []string
 	for i, name := range names {
 		if *name == "" {
 			*name = defaults[i]
 		}
 		norm := normalizeHeaderKey(*name)
 		if !validHeaderName(*name) || forbiddenHeader(norm) || seen[norm] {
-			return HeaderNames{}, nil, fmt.Errorf("invalid or duplicate identity header %q", *name)
+			return HeaderNames{}, nil, nil, fmt.Errorf("invalid or duplicate identity header %q", *name)
 		}
 		seen[norm] = true
+		*name = textproto.CanonicalMIMEHeaderKey(*name)
+		if !strings.HasPrefix(norm, "x-auth-request-") {
+			customScrub = append(customScrub, *name)
+		}
 	}
-	cleanExtra := make([]string, 0, len(extra))
+	cleanExtra := make([]extraHeaderPair, 0, len(extra))
 	for _, name := range extra {
 		norm := normalizeHeaderKey(name)
 		if !validHeaderName(name) || forbiddenHeader(norm) || seen[norm] {
-			return HeaderNames{}, nil, fmt.Errorf("invalid or duplicate custom claim header %q", name)
+			return HeaderNames{}, nil, nil, fmt.Errorf("invalid or duplicate custom claim header %q", name)
 		}
 		seen[norm] = true
-		cleanExtra = append(cleanExtra, name)
+		canon := textproto.CanonicalMIMEHeaderKey(name)
+		cleanExtra = append(cleanExtra, extraHeaderPair{orig: name, canon: canon})
+		if !strings.HasPrefix(norm, "x-auth-request-") {
+			customScrub = append(customScrub, canon)
+		}
 	}
-	return h, cleanExtra, nil
+	return h, cleanExtra, customScrub, nil
 }
 
 func normByte(b byte) byte {
@@ -166,21 +192,17 @@ func forbiddenHeader(name string) bool {
 // scrubHeaders removes client-provided identity headers, forwarding metadata,
 // and bearer credentials in a single pass, treating hyphens and underscores
 // equivalently to prevent WSGI/CGI-style header aliasing.
-func scrubHeaders(headers http.Header, names HeaderNames, extra []string) {
+func scrubHeaders(headers http.Header, customScrub []string) {
 	for key := range headers {
 		if headerHasPrefixFold(key, "x-auth-request-") ||
 			headerHasPrefixFold(key, "x-forwarded-") ||
 			headerEqualFold(key, "forwarded") ||
 			headerEqualFold(key, "x-real-ip") ||
-			headerEqualFold(key, "authorization") ||
-			headerEqualFold(key, names.User) ||
-			headerEqualFold(key, names.Email) ||
-			headerEqualFold(key, names.Groups) ||
-			headerEqualFold(key, names.Roles) {
+			headerEqualFold(key, "authorization") {
 			delete(headers, key)
 			continue
 		}
-		for _, custom := range extra {
+		for _, custom := range customScrub {
 			if headerEqualFold(key, custom) {
 				delete(headers, key)
 				break
@@ -190,15 +212,41 @@ func scrubHeaders(headers http.Header, names HeaderNames, extra []string) {
 }
 
 func validValue(value string) bool {
-	if strings.TrimSpace(value) != value {
+	if len(value) == 0 {
+		return true
+	}
+	if value[0] <= ' ' || value[len(value)-1] <= ' ' {
 		return false
 	}
-	for _, r := range value {
-		if unicode.IsControl(r) {
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b < 0x20 || b == 0x7f {
 			return false
+		}
+		if b >= 0x80 {
+			if strings.TrimSpace(value) != value {
+				return false
+			}
+			for _, r := range value[i:] {
+				if unicode.IsControl(r) {
+					return false
+				}
+			}
+			return true
 		}
 	}
 	return true
+}
+
+func joinComma(list []string) string {
+	switch len(list) {
+	case 0:
+		return ""
+	case 1:
+		return list[0]
+	default:
+		return strings.Join(list, ",")
+	}
 }
 
 type verifiedPayload struct {
@@ -209,14 +257,14 @@ type verifiedPayload struct {
 	anon      bool
 }
 
-func identityValues(identity auth.Identity, extraNames []string) (verifiedPayload, bool) {
+func identityValues(identity auth.Identity, extraNames []extraHeaderPair) (verifiedPayload, bool) {
 	if identity.User == "" || !validValue(identity.User) || !validValue(identity.Email) {
 		return verifiedPayload{}, false
 	}
 	// Commas are the list separator and must not be interpreted as extra claims.
 	for _, list := range [2][]string{identity.Groups, identity.Roles} {
 		for _, value := range list {
-			if value == "" || !validValue(value) || strings.Contains(value, ",") {
+			if value == "" || !validValue(value) || strings.IndexByte(value, ',') >= 0 {
 				return verifiedPayload{}, false
 			}
 		}
@@ -224,12 +272,12 @@ func identityValues(identity auth.Identity, extraNames []string) (verifiedPayloa
 	var extra map[string]string
 	if len(extraNames) > 0 && len(identity.Extra) > 0 {
 		extra = make(map[string]string, len(identity.Extra))
-		for _, name := range extraNames {
-			if val, ok := identity.Extra[name]; ok {
+		for _, pair := range extraNames {
+			if val, ok := identity.Extra[pair.orig]; ok {
 				if !validValue(val) {
 					return verifiedPayload{}, false
 				}
-				extra[name] = val
+				extra[pair.canon] = val
 			}
 		}
 	}
@@ -237,8 +285,8 @@ func identityValues(identity auth.Identity, extraNames []string) (verifiedPayloa
 		values: [4]string{
 			identity.User,
 			identity.Email,
-			strings.Join(identity.Groups, ","),
-			strings.Join(identity.Roles, ","),
+			joinComma(identity.Groups),
+			joinComma(identity.Roles),
 		},
 		extra:    extra,
 		rawToken: identity.RawToken,
@@ -249,44 +297,46 @@ func inject(headers http.Header, names HeaderNames, payload verifiedPayload, pas
 	if payload.anon {
 		return
 	}
-	headers.Set(names.User, payload.values[0])
-	headers.Set(names.Email, payload.values[1])
-	headers.Set(names.Groups, payload.values[2])
-	headers.Set(names.Roles, payload.values[3])
+	// Single 4-element backing array avoids 4 separate []string slice allocations.
+	vals := payload.values
+	headers[names.User] = vals[0:1:1]
+	headers[names.Email] = vals[1:2:2]
+	headers[names.Groups] = vals[2:3:3]
+	headers[names.Roles] = vals[3:4:4]
 	for k, v := range payload.extra {
-		headers.Set(k, v)
+		headers[k] = []string{v}
 	}
 	if passToken && payload.rawToken != "" {
 		if forwardAuth {
-			headers.Set("X-Auth-Request-Access-Token", payload.rawToken)
+			headers["X-Auth-Request-Access-Token"] = []string{payload.rawToken}
 		} else {
-			headers.Set("Authorization", "Bearer "+payload.rawToken)
+			headers["Authorization"] = []string{"Bearer " + payload.rawToken}
 		}
 	}
 }
 
 func securityHeaders(headers http.Header, isTLS bool) {
-	headers.Set("X-Content-Type-Options", "nosniff")
-	headers.Set("X-Frame-Options", "DENY")
-	headers.Set("Referrer-Policy", "no-referrer")
+	headers["X-Content-Type-Options"] = hdrNoSniff
+	headers["X-Frame-Options"] = hdrDeny
+	headers["Referrer-Policy"] = hdrNoRef
 	if isTLS {
-		headers.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		headers["Strict-Transport-Security"] = hdrHSTS
 	}
 }
 
 func writeUnauthorized(w http.ResponseWriter) {
-	w.Header().Set("WWW-Authenticate", "Bearer")
+	w.Header()["Www-Authenticate"] = hdrWWWAuthBearer
 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
 }
 
-func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, names HeaderNames, extra []string, opts Options, mode string) (verifiedPayload, bool) {
+func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, extra []extraHeaderPair, customScrub []string, opts Options, mode string) (verifiedPayload, bool) {
 	securityHeaders(w.Header(), r.TLS != nil)
 	var cleanPath string
 	if opts.ACL != nil || opts.UMA != nil {
 		var pathOK bool
 		cleanPath, pathOK = acl.NormalizeRequestPath(r)
 		if !pathOK {
-			scrubHeaders(r.Header, names, extra)
+			scrubHeaders(r.Header, customScrub)
 			opts.Metrics.RecordRequest(mode, "forbidden")
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return verifiedPayload{}, false
@@ -294,13 +344,13 @@ func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, nam
 	}
 	authMode := opts.ACL.AuthModeForPath(r, cleanPath)
 	if authMode == acl.ModePublic {
-		scrubHeaders(r.Header, names, extra)
+		scrubHeaders(r.Header, customScrub)
 		opts.Metrics.RecordRequest(mode, "public")
 		return verifiedPayload{anon: true, cleanPath: cleanPath}, true
 	}
 
-	authHeaders := r.Header.Values("Authorization")
-	scrubHeaders(r.Header, names, extra)
+	authHeaders := r.Header["Authorization"]
+	scrubHeaders(r.Header, customScrub)
 
 	var bearer string
 	switch len(authHeaders) {
@@ -382,18 +432,23 @@ func NewForwardAuthWithOptions(verifier Verifier, opts Options) (http.Handler, e
 	if verifier == nil {
 		return nil, errors.New("verifier is required")
 	}
-	names, extra, err := opts.Headers.normalized(opts.ExtraHeaders)
+	names, extra, customScrub, err := opts.Headers.normalized(opts.ExtraHeaders)
 	if err != nil {
 		return nil, err
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Add("Vary", "Authorization")
-		payload, ok := authenticate(w, r, verifier, names, extra, opts, "forward_auth")
+		h := w.Header()
+		h["Cache-Control"] = hdrNoStore
+		if len(h["Vary"]) == 0 {
+			h["Vary"] = hdrVaryAuth
+		} else {
+			h.Add("Vary", "Authorization")
+		}
+		payload, ok := authenticate(w, r, verifier, extra, customScrub, opts, "forward_auth")
 		if !ok {
 			return
 		}
-		inject(w.Header(), names, payload, opts.PassAccessToken, true)
+		inject(h, names, payload, opts.PassAccessToken, true)
 		w.WriteHeader(http.StatusOK)
 	}), nil
 }
@@ -451,7 +506,7 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 	if verifier == nil {
 		return nil, errors.New("verifier is required")
 	}
-	names, extra, err := opts.Headers.normalized(opts.ExtraHeaders)
+	names, extra, customScrub, err := opts.Headers.normalized(opts.ExtraHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -485,8 +540,8 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   512,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: headerTimeout,
@@ -505,7 +560,7 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 				req.Out.URL.RawPath = ""
 			}
 			req.SetURL(target)
-			scrubHeaders(req.Out.Header, names, extra)
+			scrubHeaders(req.Out.Header, customScrub)
 			if opts.Session != nil {
 				opts.Session.StripCookies(req.Out.Header)
 			}
@@ -513,9 +568,9 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 		},
 		ModifyResponse: func(response *http.Response) error {
 			// The handler has already set these headers on the client response.
-			response.Header.Del("X-Content-Type-Options")
-			response.Header.Del("X-Frame-Options")
-			response.Header.Del("Referrer-Policy")
+			delete(response.Header, "X-Content-Type-Options")
+			delete(response.Header, "X-Frame-Options")
+			delete(response.Header, "Referrer-Policy")
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -529,7 +584,7 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		payload, ok := authenticate(w, r, verifier, names, extra, opts, "reverse_proxy")
+		payload, ok := authenticate(w, r, verifier, extra, customScrub, opts, "reverse_proxy")
 		if !ok {
 			return
 		}

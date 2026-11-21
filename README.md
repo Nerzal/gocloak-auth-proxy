@@ -1,6 +1,12 @@
 # gocloak-auth-proxy
 
-A security-first, high-performance Go authentication proxy built specifically for **Keycloak** using `github.com/Nerzal/gocloak/v15` and the Go standard library — with **minimal third-party dependencies** (enforced via `depguard`).
+[![CI](https://github.com/Nerzal/gocloak-auth-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Nerzal/gocloak-auth-proxy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Nerzal/gocloak-auth-proxy)](https://github.com/Nerzal/gocloak-auth-proxy/releases/latest)
+[![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![GHCR](https://img.shields.io/badge/GHCR-~11.3%20MB%20distroless-2496ED?logo=docker&logoColor=white)](https://github.com/Nerzal/gocloak-auth-proxy/pkgs/container/gocloak-auth-proxy)
+[![License](https://img.shields.io/github/license/Nerzal/gocloak-auth-proxy)](LICENSE)
+
+A security-first, high-performance Go authentication proxy built specifically for **Keycloak** using [`github.com/Nerzal/gocloak/v15`](https://github.com/Nerzal/gocloak) and the Go standard library — with **minimal third-party dependencies** (enforced via `depguard`).
 
 It supports **Forward-Auth** (Traefik / Nginx `auth_request`), **Reverse-Proxy**, and **Browser SSO (OIDC Authorization Code + PKCE)** out of the box.
 
@@ -56,7 +62,7 @@ gh attestation verify oci://ghcr.io/nerzal/gocloak-auth-proxy:v${VERSION} -R Ner
 
 ### Go Install
 
-Requires Go 1.26 or newer:
+Requires Go 1.27 or newer:
 
 ```sh
 go install github.com/Nerzal/gocloak-auth-proxy/cmd/gocloak-auth-proxy@latest
@@ -267,34 +273,56 @@ http:
 
 ## Benchmarks
 
+![gocloak-auth-proxy Head-to-Head Cross-Language Benchmarks](docs/assets/benchmark-overview.svg)
+
+![gocloak-auth-proxy pprof Optimization Impact](docs/assets/pprof-progression.svg)
+
 ### Go Microbenchmarks
 
-Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 1.27 (`linux/amd64`, Intel Xeon 6985P-C):
+Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 1.27.4 + [`gocloak v15.1.0`](https://github.com/Nerzal/gocloak) (`linux/amd64`, Intel Xeon 6985P-C):
 
 | Benchmark | Time / Op | Bytes / Op | Allocs / Op | Scope |
 | --- | ---: | ---: | ---: | --- |
-| `BenchmarkPolicy` | `118.8 ns` | `0 B` | `0` | Path normalization + ACL mode + route role check |
-| `BenchmarkIntrospectorCacheHit` | `243.1 ns` | `0 B` | `0` | Parallel `RLock` introspection cache hit (SHA-256 token lookup) |
-| `BenchmarkForwardAuth` | `2.26 µs` | `2416 B` | `25` | Header scrubbing + identity injection (mock verifier + `httptest.ResponseRecorder`) |
-| `BenchmarkReadSession` | `4.26 µs` | `2761 B` | `6` | OIDC in-place AES-256-GCM session cookie decryption & JSON decode |
-| `BenchmarkVerify/RS256` | `37.5 µs` | `6379 B` | `79` | Full RS256 (2048-bit) JWT signature + claims + RBAC verification |
-| `BenchmarkVerifyEdDSA` | `58.6 µs` | `8509 B` | `104` | Full Ed25519 (`EdDSA`) JWT verification + `CUSTOM_CLAIM_HEADERS` extraction |
-| `BenchmarkVerify/ES256` | `75.5 µs` | `5995 B` | `90` | Full ES256 (P-256) JWT signature + claims + RBAC verification |
+| `BenchmarkPolicy` | `128.0 ns` | `0 B` | `0` | Path normalization + ACL mode + route role check |
+| `BenchmarkIntrospectorCacheHit` | `192.3 ns` | `0 B` | `0` | Parallel `RLock` introspection cache hit (SHA-256 token lookup) |
+| `BenchmarkVerifyCached` | `463.1 ns` | `0 B` | `0` | Parallel verified-token cache hit (SHA-256 + `exp`/`nbf` + JWKS key-identity check) |
+| `BenchmarkForwardAuth` | `1.62 µs` | `2336 B` | `17` | Header scrubbing + pre-canonicalized identity injection (`httptest.ResponseRecorder`) |
+| `BenchmarkReadSession` | `2.76 µs` | `1328 B` | `3` | OIDC pooled base64 + in-place AES-256-GCM decrypt + `encoding/json/v2` decode |
+| `BenchmarkVerify/RS256` | `30.0 µs` | `1728 B` | `33` | Cold RS256 (2048-bit) JWS signature + streaming `jsontext` claims + RBAC |
+| `BenchmarkVerifyEdDSA` | `45.5 µs` | `624 B` | `24` | Cold Ed25519 (`EdDSA`) JWS verify + single-pass `CUSTOM_CLAIM_HEADERS` |
+| `BenchmarkVerify/ES256` | `67.7 µs` | `1536 B` | `44` | Cold ES256 (P-256) JWS signature + streaming `jsontext` claims + RBAC |
 
-### Live Head-to-Head Comparison
+### Live Head-to-Head Cross-Language Comparison
 
-Measured on the same machine (`linux/amd64`, Intel Xeon 6985P-C, `GOMAXPROCS=2`, 2048-bit RS256 Bearer JWT, local mock Keycloak JWKS & upstream, access logging disabled, 0 errors across all runs):
+Measured with `make bench-compare` on the same machine (`linux/amd64`, Intel Xeon 6985P-C, `GOMAXPROCS=2`, `C=32`, `D=5s`, 2048-bit RS256 Bearer JWT, `gocloak v15.1.0` with `SetDirectBodyRead()`, local mock Keycloak JWKS & upstream, 0 errors across all runs):
 
-| Proxy | Binary | `go.mod` Deps | Idle RAM | Reverse-Proxy (`C=32`) | Forward-Auth (`C=32`) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **`gocloak-auth-proxy`** | **8.6 MB** | **8** | **9.1 MB** | **8,737 RPS** (`p50 3.36 ms`) | **15,825 RPS** (`p50 1.80 ms`) |
-| `GoGatekeeper v5.1.0` | 39 MB | 104 | 28.4 MB | 4,754 RPS (`p50 6.22 ms`) | 5,801 RPS (`p50 5.04 ms`) |
-| `oauth2-proxy v7.15.6` | 42 MB | 74 | 20.9 MB | 2,851 RPS (`p50 10.55 ms`) | 6,625 RPS (`p50 4.09 ms`) |
+| Proxy | Runtime | Mode | Token Mode | RPS | p50 | p95 | p99 | Idle / Load RSS |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **`gocloak-auth-proxy` (Warm)** | **Go 1.27** | Forward-Auth | Warm | **25,169** | **1.08 ms** | **3.25 ms** | **4.60 ms** | **9.2 / 15.3 MB** |
+| `rust-auth-proxy` (Axum + `jsonwebtoken`) | Rust 1.100 | Forward-Auth | Cold (2000) | 21,616 | 1.32 ms | 2.95 ms | 4.31 ms | 2.6 / 3.8 MB |
+| **`gocloak-auth-proxy` (Cold)** | **Go 1.27** | Forward-Auth | Cold (2000) | **15,002** | **1.99 ms** | **4.78 ms** | **6.45 ms** | **9.2 / 15.7 MB** |
+| `java-auth-proxy` (`HttpServer`) | Java 17 | Forward-Auth | Cold (2000) | 6,839 | 3.71 ms | 11.35 ms | 19.15 ms | 38.5 / 104.9 MB |
+| `oauth2-proxy v7.15.6` | Go | Forward-Auth | Warm | 6,023 | 4.47 ms | 12.39 ms | 18.93 ms | 19.8 / 26.7 MB |
+| `python-auth-proxy` (Uvicorn + PyJWT) | Python 3.11 | Forward-Auth | Cold (2000) | 5,811 | 5.14 ms | 8.06 ms | 10.88 ms | 14.7 MB (master) |
+| **`gocloak-auth-proxy` (Warm)** | **Go 1.27** | Reverse-Proxy | Warm | **11,248** | **2.51 ms** | **5.94 ms** | **7.82 ms** | **9.2 / 16.1 MB** |
+| `rust-auth-proxy` (Axum + `reqwest`) | Rust 1.100 | Reverse-Proxy | Cold (2000) | 10,629 | 2.86 ms | 4.95 ms | 6.63 ms | 2.4 / 6.3 MB |
+| **`gocloak-auth-proxy` (Cold)** | **Go 1.27** | Reverse-Proxy | Cold (2000) | **7,583** | **3.90 ms** | **7.89 ms** | **9.79 ms** | **9.2 / 16.2 MB** |
+| `oauth2-proxy v7.15.6` | Go | Reverse-Proxy | Warm | 2,245 | 13.39 ms | 26.98 ms | 33.67 ms | 19.9 / 27.8 MB |
+| `java-auth-proxy` (`HttpClient`) | Java 17 | Reverse-Proxy | Cold (2000) | 1,978 | 14.23 ms | 29.00 ms | 35.59 ms | 38.1 / 114.4 MB |
+| `python-auth-proxy` (Uvicorn + `httpx`) | Python 3.11 | Reverse-Proxy | Cold (2000) | 734 | 32.95 ms | 108.97 ms | 169.99 ms | 14.7 MB (master) |
 
-Run locally to reproduce Go microbenchmarks on your hardware:
+### Running Benchmarks & Profiles Locally
 
 ```sh
-make bench
+make bench            # Go microbenchmarks with allocation stats
+make bench-profile    # Capture CPU & memory pprof profiles + top summaries
+make bench-isolated   # Isolated live HTTP benchmark (gocloak-auth-proxy Warm & Cold)
+make bench-compare    # Cross-language benchmark (Go, Rust, Java, Python)
+make bench-charts     # Regenerate docs/assets/*.svg benchmark charts
+
+# Non-isolated benchmark against a real Keycloak 26 instance:
+docker compose -f bench/docker-compose.keycloak.yml up -d
+make bench-keycloak
 ```
 
 ---
@@ -321,3 +349,12 @@ make check       # Full local quality gate (lint, security, test-race, bench, bu
 ```
 
 CI runs `test` (`-race`), `lint`, `security` (`govulncheck` + `gosec`), and `CodeQL` on every push and pull request.
+
+---
+
+## Related Projects
+
+Part of the **GoCloak** Keycloak ecosystem for Go:
+
+- [**gocloak**](https://github.com/Nerzal/gocloak) — Golang Keycloak Admin & OpenID Connect API client library (`v15`)
+- [**gocloak-mcp**](https://github.com/Nerzal/gocloak-mcp) — Security-first, read-only Keycloak MCP server in Go (Stdio & Streamable HTTP)
