@@ -1,4 +1,4 @@
-.PHONY: build test test-race bench bench-profile bench-isolated bench-compare bench-keycloak lint vuln security check
+.PHONY: build test test-race bench bench-profile bench-isolated bench-compare bench-keycloak bench-charts lint vuln security check
 
 build:
 	go build ./...
@@ -23,6 +23,9 @@ bench-compare:
 
 bench-keycloak:
 	bash ./bench/run_keycloak.sh
+
+bench-charts:
+	python3 ./bench/render_charts.py
 
 lint:
 	golangci-lint run

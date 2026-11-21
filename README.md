@@ -6,7 +6,7 @@
 [![GHCR](https://img.shields.io/badge/GHCR-~11.3%20MB%20distroless-2496ED?logo=docker&logoColor=white)](https://github.com/Nerzal/gocloak-auth-proxy/pkgs/container/gocloak-auth-proxy)
 [![License](https://img.shields.io/github/license/Nerzal/gocloak-auth-proxy)](LICENSE)
 
-A security-first, high-performance Go authentication proxy built specifically for **Keycloak** using `github.com/Nerzal/gocloak/v15` and the Go standard library — with **minimal third-party dependencies** (enforced via `depguard`).
+A security-first, high-performance Go authentication proxy built specifically for **Keycloak** using [`github.com/Nerzal/gocloak/v15`](https://github.com/Nerzal/gocloak) and the Go standard library — with **minimal third-party dependencies** (enforced via `depguard`).
 
 It supports **Forward-Auth** (Traefik / Nginx `auth_request`), **Reverse-Proxy**, and **Browser SSO (OIDC Authorization Code + PKCE)** out of the box.
 
@@ -273,9 +273,13 @@ http:
 
 ## Benchmarks
 
+![gocloak-auth-proxy Head-to-Head Cross-Language Benchmarks](docs/assets/benchmark-overview.svg)
+
+![gocloak-auth-proxy pprof Optimization Impact](docs/assets/pprof-progression.svg)
+
 ### Go Microbenchmarks
 
-Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 1.27.4 + `gocloak v15.1.0` (`linux/amd64`, Intel Xeon 6985P-C):
+Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 1.27.4 + [`gocloak v15.1.0`](https://github.com/Nerzal/gocloak) (`linux/amd64`, Intel Xeon 6985P-C):
 
 | Benchmark | Time / Op | Bytes / Op | Allocs / Op | Scope |
 | --- | ---: | ---: | ---: | --- |
@@ -291,38 +295,6 @@ Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 
 ### Live Head-to-Head Cross-Language Comparison
 
 Measured with `make bench-compare` on the same machine (`linux/amd64`, Intel Xeon 6985P-C, `GOMAXPROCS=2`, `C=32`, `D=5s`, 2048-bit RS256 Bearer JWT, `gocloak v15.1.0` with `SetDirectBodyRead()`, local mock Keycloak JWKS & upstream, 0 errors across all runs):
-
-#### Forward-Auth Throughput (RPS — higher is better)
-
-```mermaid
-xychart-beta horizontal
-    title "Forward-Auth Throughput (RPS, C=32, RS256 2048-bit)"
-    x-axis ["gocloak-auth-proxy (Warm)", "Rust Axum (Cold)", "gocloak-auth-proxy (Cold)", "Java 17 (Cold)", "oauth2-proxy v7.15 (Warm)", "Python Uvicorn (Cold)"]
-    y-axis "Requests / sec" 0 --> 28000
-    bar [25169, 21616, 15002, 6839, 6023, 5811]
-```
-
-#### Reverse-Proxy Throughput (RPS — higher is better)
-
-```mermaid
-xychart-beta horizontal
-    title "Reverse-Proxy Throughput (RPS, C=32, RS256 2048-bit)"
-    x-axis ["gocloak-auth-proxy (Warm)", "Rust Axum (Cold)", "gocloak-auth-proxy (Cold)", "oauth2-proxy v7.15 (Warm)", "Java 17 (Cold)", "Python Uvicorn (Cold)"]
-    y-axis "Requests / sec" 0 --> 12500
-    bar [11248, 10629, 7583, 2245, 1978, 734]
-```
-
-#### Memory Footprint Under Load (Reverse-Proxy Load RSS in MB — lower is better)
-
-```mermaid
-xychart-beta horizontal
-    title "Reverse-Proxy Memory Under Load (MB RSS, lower is better)"
-    x-axis ["Rust Axum", "gocloak-auth-proxy (Warm)", "gocloak-auth-proxy (Cold)", "oauth2-proxy v7.15", "Java 17"]
-    y-axis "RSS (MB)" 0 --> 120
-    bar [6, 16, 16, 28, 114]
-```
-
-#### Detailed Metrics
 
 | Proxy | Runtime | Mode | Token Mode | RPS | p50 | p95 | p99 | Idle / Load RSS |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -346,6 +318,7 @@ make bench            # Go microbenchmarks with allocation stats
 make bench-profile    # Capture CPU & memory pprof profiles + top summaries
 make bench-isolated   # Isolated live HTTP benchmark (gocloak-auth-proxy Warm & Cold)
 make bench-compare    # Cross-language benchmark (Go, Rust, Java, Python)
+make bench-charts     # Regenerate docs/assets/*.svg benchmark charts
 
 # Non-isolated benchmark against a real Keycloak 26 instance:
 docker compose -f bench/docker-compose.keycloak.yml up -d
@@ -376,3 +349,12 @@ make check       # Full local quality gate (lint, security, test-race, bench, bu
 ```
 
 CI runs `test` (`-race`), `lint`, `security` (`govulncheck` + `gosec`), and `CodeQL` on every push and pull request.
+
+---
+
+## Related Projects
+
+Part of the **GoCloak** Keycloak ecosystem for Go:
+
+- [**gocloak**](https://github.com/Nerzal/gocloak) — Golang Keycloak Admin & OpenID Connect API client library (`v15`)
+- [**gocloak-mcp**](https://github.com/Nerzal/gocloak-mcp) — Security-first, read-only Keycloak MCP server in Go (Stdio & Streamable HTTP)
