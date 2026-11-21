@@ -214,7 +214,7 @@ func New(cfg Config, verifier TokenVerifier) (*Manager, error) {
 			return errors.New("redirects are not allowed on token endpoint")
 		},
 	}
-	kcClient := gocloak.NewClient(baseURL)
+	kcClient := gocloak.NewClient(baseURL, gocloak.SetDirectBodyRead())
 	kcClient.RestyClient().SetTransport(transport)
 	kcClient.RestyClient().GetClient().CheckRedirect = func(*http.Request, []*http.Request) error {
 		return errors.New("redirects are not allowed")

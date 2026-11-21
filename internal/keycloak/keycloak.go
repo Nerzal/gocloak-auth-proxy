@@ -105,7 +105,7 @@ func NewBoundedTransport(tlsCfg *tls.Config, maxBytes int64) http.RoundTripper {
 }
 
 func newClient(baseURL string, transport http.RoundTripper) *gocloak.GoCloak {
-	client := gocloak.NewClient(baseURL)
+	client := gocloak.NewClient(baseURL, gocloak.SetDirectBodyRead())
 	client.RestyClient().SetTransport(transport)
 	client.RestyClient().GetClient().CheckRedirect = func(*http.Request, []*http.Request) error {
 		return errors.New("redirects are not allowed")
