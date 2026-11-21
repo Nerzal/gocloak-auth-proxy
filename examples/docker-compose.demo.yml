@@ -1,0 +1,31 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    volumes:
+      - ../bench/keycloak-realm.json:/opt/keycloak/data/import/bench-realm.json:ro
+    ports:
+      - "18080:8080"
+
+  auth-proxy:
+    image: ghcr.io/nerzal/gocloak-auth-proxy:latest
+    depends_on:
+      - keycloak
+    environment:
+      ISSUER: http://keycloak:8080/realms/bench
+      AUDIENCE: bench-api
+      UPSTREAM_URL: http://whoami:80
+      LISTEN_ADDR: ":8080"
+      METRICS_ADDR: ":9090"
+      ACCESS_LOG: "true"
+      LOG_LEVEL: debug
+      SHUTDOWN_DRAIN_DELAY: 3s
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+
+  whoami:
+    image: traefik/whoami:v1.10

@@ -60,6 +60,14 @@ gh attestation verify "gocloak-auth-proxy_${VERSION}_${OS}_${ARCH}.tar.gz" -R Ne
 gh attestation verify oci://ghcr.io/nerzal/gocloak-auth-proxy:v${VERSION} -R Nerzal/gocloak-auth-proxy
 ```
 
+### Helm Chart (Kubernetes — OCI on GHCR)
+
+```sh
+helm install gocloak-auth-proxy oci://ghcr.io/nerzal/charts/gocloak-auth-proxy \
+  --set config.issuer=https://keycloak.example.com/realms/myrealm \
+  --set config.audience=my-api
+```
+
 ### Go Install
 
 Requires Go 1.27 or newer:
@@ -67,6 +75,14 @@ Requires Go 1.27 or newer:
 ```sh
 go install github.com/Nerzal/gocloak-auth-proxy/cmd/gocloak-auth-proxy@latest
 ```
+
+### CLI Flags & Systemd
+
+- `gocloak-auth-proxy --version` — print build version, commit, and timestamp
+- `gocloak-auth-proxy --check-config` — validate `CONFIG_FILE`, environment variables, and TLS/CA files (exit `0`/`1`, ideal for CI & `systemd ExecStartPre`)
+- `gocloak-auth-proxy --print-config` — print effective merged configuration as JSON with all secrets replaced by `[REDACTED]`
+
+A hardened `systemd` unit (with `DynamicUser=yes`, `ProtectSystem=strict`, `--check-config`, and `SIGHUP` live TLS reload) is provided in [`deploy/systemd/`](deploy/systemd/). Ready-to-run Docker Compose and Caddy examples live in [`examples/`](examples/).
 
 ---
 
@@ -243,7 +259,8 @@ http:
 | --- | --- | --- |
 | `OIDC_ENABLED` | `false` | Enable Authorization Code + PKCE browser SSO (`/oauth2/start`, `/oauth2/callback`, `/oauth2/logout`, `/oauth2/backchannel-logout`). |
 | `OIDC_REDIRECT_URL` | `""` | Required when `OIDC_ENABLED=true`. Absolute callback URL (e.g. `https://app.example.com/oauth2/callback`). |
-| `OIDC_COOKIE_SECRET` | `""` | Required when `OIDC_ENABLED=true`. Secret for AES-256-GCM cookie encryption (min 32 characters). |
+| `OIDC_COOKIE_SECRET` / `OIDC_COOKIE_SECRET_FILE` | `""` | Required when `OIDC_ENABLED=true`. Secret (or file path) for AES-256-GCM cookie encryption (min 32 characters). |
+| `OIDC_COOKIE_SECRET_PREVIOUS` / `OIDC_COOKIE_SECRET_PREVIOUS_FILE` | `""` | Optional previous cookie secret for zero-downtime key rotation (encrypts with primary, decrypts with primary or previous). |
 | `OIDC_POST_LOGOUT_URL` | `/` | Safe relative path or absolute HTTP(S) URL redirected to after `/oauth2/logout`. |
 | `OIDC_COOKIE_NAME` | `__Host-gocloak_session` | Session cookie name (defaults to `gocloak_session` when `OIDC_COOKIE_SECURE=false` or `OIDC_COOKIE_DOMAIN` is set). |
 | `OIDC_COOKIE_DOMAIN` | `""` | Optional cookie `Domain` attribute (e.g. `.example.com`) for multi-subdomain SSO (incompatible with `__Host-` prefix). |
@@ -253,18 +270,21 @@ http:
 | `OIDC_SESSION_MAX_AGE` | `24h` | Absolute session lifetime enforced both on cookies and inside the encrypted payload. |
 | `OIDC_REDIRECT` | `true` | Redirect unauthenticated HTML `GET` requests (`302`) to `/oauth2/start` instead of returning `401`. |
 | `OIDC_ALLOWED_REDIRECT_DOMAINS` | `""` | Comma-separated allowlist of redirect hosts or `.suffix` domains (e.g. `app1.example.com,.example.com`) for multi-domain SSO. |
+| `REDIS_ADDR` / `REDIS_PASSWORD(_FILE)` / `REDIS_TLS` / `REDIS_CA_FILE` | `""` | Optional zero-dependency RESP2 Redis/Valkey store for sharing backchannel-logout revocations across multiple replicas. |
 
 ### TLS, Timeouts & Observability
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `KEYCLOAK_CA_FILE` | `""` | Optional PEM CA bundle for TLS connections to Keycloak. |
-| `KEYCLOAK_CLIENT_CERT_FILE` / `KEYCLOAK_CLIENT_KEY_FILE` | `""` | Optional mTLS client certificate and private key for connections to Keycloak. |
+| `KEYCLOAK_CLIENT_CERT_FILE` / `KEYCLOAK_CLIENT_KEY_FILE` | `""` | Optional auto-reloading mTLS client certificate and private key for connections to Keycloak. |
 | `UPSTREAM_CA_FILE` | `""` | Optional PEM CA bundle for TLS connections to the reverse-proxy upstream. |
-| `UPSTREAM_CLIENT_CERT_FILE` / `UPSTREAM_CLIENT_KEY_FILE` | `""` | Optional mTLS client certificate and private key for connections to the upstream. |
-| `TLS_CERT_FILE` / `TLS_KEY_FILE` | `""` | Optional TLS 1.2+ certificate and key for the proxy listener (enables HSTS automatically). |
-| `METRICS_ADDR` | `""` | Optional dedicated listen address for Prometheus `/metrics` (e.g. `:9090`); keep internal, never expose publicly. |
-| `LOG_LEVEL` | `info` | Structured JSON log level: `debug`, `info`, `warn`, `error` (correlates W3C `traceparent` as `trace_id`). |
+| `UPSTREAM_CLIENT_CERT_FILE` / `UPSTREAM_CLIENT_KEY_FILE` | `""` | Optional auto-reloading mTLS client certificate and private key for connections to the upstream. |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | `""` | Optional TLS 1.2+ certificate and key for the proxy listener (enables HSTS automatically; supports live reload on file change or `SIGHUP`). |
+| `METRICS_ADDR` | `""` | Optional dedicated listen address for Prometheus `/metrics` (counters + `request_duration_seconds` histograms); keep internal. |
+| `LOG_LEVEL` | `info` | Structured JSON log level: `debug` (includes safe rejection reasons like `expired`, `audience_mismatch`, `missing_realm_role`), `info`, `warn`, `error`. |
+| `ACCESS_LOG` | `false` | Emit structured JSON access logs (`method`, `path`, `status`, `duration_ms`, `mode`, `trace_id`; never logs tokens/cookies/emails). |
+| `SHUTDOWN_DRAIN_DELAY` | `0s` | Graceful drain window (`0s`–`5m`) after flipping `/readyz` to `503` on `SIGTERM` before closing connections (prevents 502s during K8s rollouts). |
 | `SERVER_READ_HEADER_TIMEOUT` / `SERVER_READ_TIMEOUT` | `5s` / `15s` | Inbound HTTP server header and body read timeouts. |
 | `SERVER_WRITE_TIMEOUT` / `SERVER_IDLE_TIMEOUT` | `30s` / `60s` | Inbound HTTP write/idle timeouts (set `SERVER_WRITE_TIMEOUT=0s` for WebSockets/SSE). |
 | `UPSTREAM_HEADER_TIMEOUT` / `UPSTREAM_REQUEST_TIMEOUT` | `15s` / `25s` | Outbound reverse-proxy timeouts (set `UPSTREAM_REQUEST_TIMEOUT=0s` for WebSockets/SSE). |

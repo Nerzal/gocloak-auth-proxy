@@ -150,3 +150,28 @@ jobs:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  helm:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Package and push Helm chart to GHCR OCI
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          OWNER_LOWER="${OWNER,,}"
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
+          helm lint charts/gocloak-auth-proxy
+          helm package charts/gocloak-auth-proxy --version "$VERSION" --app-version "$VERSION" -d dist-chart
+          helm push "dist-chart/gocloak-auth-proxy-${VERSION}.tgz" "oci://ghcr.io/${OWNER_LOWER}/charts"

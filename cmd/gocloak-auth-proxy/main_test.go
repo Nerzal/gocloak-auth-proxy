@@ -284,3 +284,34 @@ func TestParseCLIArgs(t *testing.T) {
 		t.Fatal("expected error for unknown flag")
 	}
 }
+
+func TestCLICheckAndPrintConfig(t *testing.T) {
+	t.Setenv("ISSUER", "https://kc.example.test/realms/demo")
+	t.Setenv("AUDIENCE", "my-api")
+	t.Setenv("CLIENT_ID", "my-app")
+	t.Setenv("CLIENT_SECRET", "top-secret-value")
+
+	var out strings.Builder
+	act, err := parseCLIAction([]string{"--check-config"}, &out)
+	if err != nil || act != cliCheckConfig {
+		t.Fatalf("expected cliCheckConfig, got %v err=%v", act, err)
+	}
+	if err := runCheckConfig(&out); err != nil {
+		t.Fatalf("runCheckConfig failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "configuration valid") {
+		t.Fatalf("unexpected check-config output: %q", out.String())
+	}
+
+	out.Reset()
+	act, err = parseCLIAction([]string{"--print-config"}, &out)
+	if err != nil || act != cliPrintConfig {
+		t.Fatalf("expected cliPrintConfig, got %v err=%v", act, err)
+	}
+	if err := runPrintConfig(&out); err != nil {
+		t.Fatalf("runPrintConfig failed: %v", err)
+	}
+	if strings.Contains(out.String(), "top-secret-value") || !strings.Contains(out.String(), "[REDACTED]") {
+		t.Fatalf("print-config did not redact secret:\n%s", out.String())
+	}
+}

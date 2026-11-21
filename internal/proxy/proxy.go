@@ -79,6 +79,8 @@ type Options struct {
 	DisableRequestTimeout  bool
 	Logger                 *slog.Logger
 	Metrics                *metrics.Registry
+	TrustedProxies         []string
+	AccessLog              bool
 }
 
 type extraHeaderPair struct {
@@ -383,6 +385,13 @@ func authenticate(w http.ResponseWriter, r *http.Request, verifier Verifier, ext
 
 	identity, err := verifier.Verify(r.Context(), bearer)
 	if err != nil {
+		if opts.Logger != nil {
+			opts.Logger.Debug("authentication rejected",
+				"mode", mode,
+				"reason", auth.Reason(err),
+				"trace_id", ExtractTraceID(r),
+			)
+		}
 		if errors.Is(err, auth.ErrForbidden) {
 			opts.Metrics.RecordRequest(mode, "forbidden")
 			http.Error(w, "Forbidden", http.StatusForbidden)
@@ -427,6 +436,34 @@ func NewForwardAuth(verifier Verifier, headers HeaderNames) (http.Handler, error
 	return NewForwardAuthWithOptions(verifier, Options{Headers: headers})
 }
 
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Unwrap() http.ResponseWriter {
+	return sr.ResponseWriter
+}
+
+func logAccess(logger *slog.Logger, mode string, r *http.Request, status int, d time.Duration) {
+	if logger == nil {
+		return
+	}
+	logger.Info("http request",
+		"mode", mode,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"status", status,
+		"duration_ms", float64(d.Microseconds())/1000.0,
+		"trace_id", ExtractTraceID(r),
+	)
+}
+
 // NewForwardAuthWithOptions returns a forward-auth handler with extended policy options.
 func NewForwardAuthWithOptions(verifier Verifier, opts Options) (http.Handler, error) {
 	if verifier == nil {
@@ -436,20 +473,40 @@ func NewForwardAuthWithOptions(verifier Verifier, opts Options) (http.Handler, e
 	if err != nil {
 		return nil, err
 	}
+	if _, err := parseTrustedProxies(opts.TrustedProxies); err != nil {
+		return nil, err
+	}
+	trackTime := opts.Metrics != nil || opts.AccessLog
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := w.Header()
+		var start time.Time
+		if trackTime {
+			start = time.Now()
+		}
+		rw := w
+		var sr *statusRecorder
+		if opts.AccessLog {
+			sr = &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			rw = sr
+		}
+		h := rw.Header()
 		h["Cache-Control"] = hdrNoStore
 		if len(h["Vary"]) == 0 {
 			h["Vary"] = hdrVaryAuth
 		} else {
 			h.Add("Vary", "Authorization")
 		}
-		payload, ok := authenticate(w, r, verifier, extra, customScrub, opts, "forward_auth")
-		if !ok {
-			return
+		payload, ok := authenticate(rw, r, verifier, extra, customScrub, opts, "forward_auth")
+		if ok {
+			inject(h, names, payload, opts.PassAccessToken, true)
+			rw.WriteHeader(http.StatusOK)
 		}
-		inject(h, names, payload, opts.PassAccessToken, true)
-		w.WriteHeader(http.StatusOK)
+		if trackTime {
+			d := time.Since(start)
+			opts.Metrics.RecordDuration("forward_auth", d)
+			if opts.AccessLog {
+				logAccess(opts.Logger, "forward_auth", r, sr.status, d)
+			}
+		}
 	}), nil
 }
 
@@ -510,6 +567,10 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 	if err != nil {
 		return nil, err
 	}
+	trustedProxies, err := parseTrustedProxies(opts.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
 	target, err := url.Parse(upstream)
 	if err != nil || target == nil || (target.Scheme != "http" && target.Scheme != "https") ||
 		target.Host == "" || target.Hostname() == "" || target.User != nil || strings.Contains(upstream, "#") || target.Opaque != "" {
@@ -549,22 +610,34 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 		TLSClientConfig:       tlsCfg,
 	}
 	type identityKey struct{}
+	type reverseState struct {
+		payload   verifiedPayload
+		forwarded forwardedMeta
+		hasFwd    bool
+	}
 	reverse := &httputil.ReverseProxy{
 		Transport:  transport,
 		BufferPool: &bufferPool{},
 		ErrorLog:   log.New(io.Discard, "", 0),
 		Rewrite: func(req *httputil.ProxyRequest) {
-			payload := req.In.Context().Value(identityKey{}).(verifiedPayload)
-			if payload.cleanPath != "" {
-				req.Out.URL.Path = payload.cleanPath
+			st := req.In.Context().Value(identityKey{}).(reverseState)
+			if st.payload.cleanPath != "" {
+				req.Out.URL.Path = st.payload.cleanPath
 				req.Out.URL.RawPath = ""
 			}
 			req.SetURL(target)
 			scrubHeaders(req.Out.Header, customScrub)
+			if st.hasFwd {
+				req.Out.Header["X-Forwarded-For"] = []string{st.forwarded.xff}
+				req.Out.Header["X-Forwarded-Proto"] = []string{st.forwarded.proto}
+				if st.forwarded.host != "" {
+					req.Out.Header["X-Forwarded-Host"] = []string{st.forwarded.host}
+				}
+			}
 			if opts.Session != nil {
 				opts.Session.StripCookies(req.Out.Header)
 			}
-			inject(req.Out.Header, names, payload, opts.PassAccessToken, false)
+			inject(req.Out.Header, names, st.payload, opts.PassAccessToken, false)
 		},
 		ModifyResponse: func(response *http.Response) error {
 			// The handler has already set these headers on the client response.
@@ -583,18 +656,40 @@ func NewReverseProxyWithOptions(verifier Verifier, upstream string, opts Options
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
 	}
+	trackTime := opts.Metrics != nil || opts.AccessLog
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		payload, ok := authenticate(w, r, verifier, extra, customScrub, opts, "reverse_proxy")
-		if !ok {
-			return
+		var start time.Time
+		if trackTime {
+			start = time.Now()
 		}
-		ctx := r.Context()
-		var cancel context.CancelFunc
-		if !opts.DisableRequestTimeout && reqTimeout > 0 {
-			ctx, cancel = context.WithTimeout(ctx, reqTimeout)
-			defer cancel()
+		rw := w
+		var sr *statusRecorder
+		if opts.AccessLog {
+			sr = &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			rw = sr
 		}
-		reverse.ServeHTTP(w, r.WithContext(context.WithValue(ctx, identityKey{}, payload)))
+		fwd, hasFwd := extractTrustedForwarded(r, trustedProxies)
+		payload, ok := authenticate(rw, r, verifier, extra, customScrub, opts, "reverse_proxy")
+		if ok {
+			ctx := r.Context()
+			var cancel context.CancelFunc
+			if !opts.DisableRequestTimeout && reqTimeout > 0 {
+				ctx, cancel = context.WithTimeout(ctx, reqTimeout)
+				defer cancel()
+			}
+			reverse.ServeHTTP(rw, r.WithContext(context.WithValue(ctx, identityKey{}, reverseState{
+				payload:   payload,
+				forwarded: fwd,
+				hasFwd:    hasFwd,
+			})))
+		}
+		if trackTime {
+			d := time.Since(start)
+			opts.Metrics.RecordDuration("reverse_proxy", d)
+			if opts.AccessLog {
+				logAccess(logger, "reverse_proxy", r, sr.status, d)
+			}
+		}
 	}), nil
 }
 

@@ -1,0 +1,10 @@
+# Caddy forward_auth integration with gocloak-auth-proxy
+app.example.com {
+    forward_auth gocloak-auth-proxy:8080 {
+        uri /auth
+        copy_headers X-Auth-Request-User X-Auth-Request-Email X-Auth-Request-Groups X-Auth-Request-Roles
+    }
+    reverse_proxy app:3000 {
+        header_up -Authorization
+    }
+}
