@@ -1,5 +1,11 @@
 # gocloak-auth-proxy
 
+[![CI](https://github.com/Nerzal/gocloak-auth-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Nerzal/gocloak-auth-proxy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Nerzal/gocloak-auth-proxy)](https://github.com/Nerzal/gocloak-auth-proxy/releases/latest)
+[![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![GHCR](https://img.shields.io/badge/GHCR-~11.3%20MB%20distroless-2496ED?logo=docker&logoColor=white)](https://github.com/Nerzal/gocloak-auth-proxy/pkgs/container/gocloak-auth-proxy)
+[![License](https://img.shields.io/github/license/Nerzal/gocloak-auth-proxy)](LICENSE)
+
 A security-first, high-performance Go authentication proxy built specifically for **Keycloak** using `github.com/Nerzal/gocloak/v15` and the Go standard library — with **minimal third-party dependencies** (enforced via `depguard`).
 
 It supports **Forward-Auth** (Traefik / Nginx `auth_request`), **Reverse-Proxy**, and **Browser SSO (OIDC Authorization Code + PKCE)** out of the box.
