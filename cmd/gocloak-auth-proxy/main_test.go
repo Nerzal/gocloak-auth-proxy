@@ -259,3 +259,28 @@ func TestEndToEndOIDCBrowserSSOAndMetrics(t *testing.T) {
 		t.Fatalf("unexpected metrics:\n%s", mRec.Body.String())
 	}
 }
+
+func TestParseCLIArgs(t *testing.T) {
+	var out strings.Builder
+	exitEarly, err := parseCLIArgs([]string{"--version"}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exitEarly {
+		t.Fatal("expected exitEarly=true for --version")
+	}
+	if !strings.HasPrefix(out.String(), "gocloak-auth-proxy ") {
+		t.Fatalf("unexpected version output: %q", out.String())
+	}
+
+	out.Reset()
+	exitEarly, err = parseCLIArgs(nil, &out)
+	if err != nil || exitEarly {
+		t.Fatalf("expected normal startup for empty args, got exitEarly=%v err=%v", exitEarly, err)
+	}
+
+	out.Reset()
+	if _, err := parseCLIArgs([]string{"--unknown-flag"}, &out); err == nil {
+		t.Fatal("expected error for unknown flag")
+	}
+}

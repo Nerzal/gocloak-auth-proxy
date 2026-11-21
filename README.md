@@ -19,19 +19,71 @@ It supports **Forward-Auth** (Traefik / Nginx `auth_request`), **Reverse-Proxy**
 
 ---
 
+## Installation
+
+### Container Image (GHCR — Recommended)
+
+Multi-arch (`linux/amd64`, `linux/arm64`), nonroot `distroless` images are published to GitHub Container Registry on every release:
+
+```sh
+docker pull ghcr.io/nerzal/gocloak-auth-proxy:latest
+# or pin to a specific release tag:
+docker pull ghcr.io/nerzal/gocloak-auth-proxy:v0.1.0
+```
+
+### Prebuilt Static Binaries (GitHub Releases)
+
+Static (`CGO_ENABLED=0`) binaries for Linux and macOS (`amd64` / `arm64`) are published on the [GitHub Releases](https://github.com/Nerzal/gocloak-auth-proxy/releases) page alongside `checksums.txt` and GitHub build provenance attestations:
+
+```sh
+VERSION=0.1.0
+OS=linux   # linux or darwin
+ARCH=amd64 # amd64 or arm64
+
+curl -fsSLO "https://github.com/Nerzal/gocloak-auth-proxy/releases/download/v${VERSION}/gocloak-auth-proxy_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSLO "https://github.com/Nerzal/gocloak-auth-proxy/releases/download/v${VERSION}/checksums.txt"
+sha256sum --ignore-missing -c checksums.txt
+tar -xzf "gocloak-auth-proxy_${VERSION}_${OS}_${ARCH}.tar.gz" gocloak-auth-proxy
+./gocloak-auth-proxy --version
+```
+
+Optionally verify build provenance with the GitHub CLI:
+
+```sh
+gh attestation verify "gocloak-auth-proxy_${VERSION}_${OS}_${ARCH}.tar.gz" -R Nerzal/gocloak-auth-proxy
+gh attestation verify oci://ghcr.io/nerzal/gocloak-auth-proxy:v${VERSION} -R Nerzal/gocloak-auth-proxy
+```
+
+### Go Install
+
+Requires Go 1.26 or newer:
+
+```sh
+go install github.com/Nerzal/gocloak-auth-proxy/cmd/gocloak-auth-proxy@latest
+```
+
+---
+
 ## Quick Start
 
-Go 1.26 or newer is required.
+### 1. Container (Forward-Auth Mode)
 
-### 1. Forward-Auth Mode (API / Ingress)
+```sh
+docker run --rm -p 8080:8080 \
+  -e ISSUER=https://keycloak.example.com/realms/myrealm \
+  -e AUDIENCE=my-api \
+  ghcr.io/nerzal/gocloak-auth-proxy:latest
+```
+
+### 2. Forward-Auth Mode (Binary / Source)
 
 ```sh
 export ISSUER=https://keycloak.example.com/realms/myrealm
 export AUDIENCE=my-api
-go run ./cmd/gocloak-auth-proxy
+gocloak-auth-proxy
 ```
 
-### 2. Reverse-Proxy Mode (with RBAC & Custom Claims)
+### 3. Reverse-Proxy Mode (with RBAC & Custom Claims)
 
 ```sh
 export ISSUER=https://keycloak.example.com/realms/myrealm
@@ -39,10 +91,10 @@ export AUDIENCE=my-api
 export UPSTREAM_URL=http://127.0.0.1:3000
 export REQUIRED_REALM_ROLES=reader
 export CUSTOM_CLAIM_HEADERS="X-Tenant-ID=tenant_id"
-go run ./cmd/gocloak-auth-proxy
+gocloak-auth-proxy
 ```
 
-### 3. Browser SSO Mode (OIDC + PKCE + Encrypted Cookies)
+### 4. Browser SSO Mode (OIDC + PKCE + Encrypted Cookies)
 
 ```sh
 export ISSUER=https://keycloak.example.com/realms/myrealm
@@ -53,17 +105,7 @@ export UPSTREAM_URL=http://127.0.0.1:3000
 export OIDC_ENABLED=true
 export OIDC_REDIRECT_URL=https://app.example.com/oauth2/callback
 export OIDC_COOKIE_SECRET="$(openssl rand -base64 32)"
-go run ./cmd/gocloak-auth-proxy
-```
-
-### 4. Container
-
-```sh
-docker build -t gocloak-auth-proxy .
-docker run --rm -p 8080:8080 \
-  -e ISSUER=https://keycloak.example.com/realms/myrealm \
-  -e AUDIENCE=my-api \
-  gocloak-auth-proxy
+gocloak-auth-proxy
 ```
 
 ---

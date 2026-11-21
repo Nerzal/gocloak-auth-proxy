@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -26,7 +28,42 @@ import (
 	"github.com/Nerzal/gocloak-auth-proxy/internal/tlsutil"
 )
 
+// Build metadata injected at link time via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+func formatVersion() string {
+	return fmt.Sprintf("gocloak-auth-proxy %s (commit %s, built %s)", version, commit, date)
+}
+
+func parseCLIArgs(args []string, out io.Writer) (exitEarly bool, err error) {
+	fs := flag.NewFlagSet("gocloak-auth-proxy", flag.ContinueOnError)
+	fs.SetOutput(out)
+	showVersion := fs.Bool("version", false, "print version information and exit")
+	if err := fs.Parse(args); err != nil {
+		return false, err
+	}
+	if *showVersion {
+		_, err := fmt.Fprintln(out, formatVersion())
+		return true, err
+	}
+	return false, nil
+}
+
 func main() {
+	exitEarly, err := parseCLIArgs(os.Args[1:], os.Stdout)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	}
+	if exitEarly {
+		os.Exit(0)
+	}
 	if err := run(); err != nil {
 		logging.New(os.Stderr).Error("server stopped", "reason", err.Error())
 		os.Exit(1)
@@ -273,7 +310,7 @@ func run() error {
 			}
 		}
 	}()
-	logger.Info("server starting", "addr", cfg.ListenAddr, "tls", cfg.TLSCertFile != "")
+	logger.Info("server starting", "version", version, "addr", cfg.ListenAddr, "tls", cfg.TLSCertFile != "")
 	if cfg.TLSCertFile != "" {
 		err = server.ServeTLS(listener, cfg.TLSCertFile, cfg.TLSKeyFile)
 	} else {
