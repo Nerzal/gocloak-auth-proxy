@@ -83,7 +83,7 @@ func (s *RedisRevocationStore) exec(ctx context.Context, args ...string) (string
 		if err := writeRESPCommand(rw.Writer, "AUTH", s.password); err != nil {
 			return "", err
 		}
-		if err := rw.Writer.Flush(); err != nil {
+		if err := rw.Flush(); err != nil {
 			return "", err
 		}
 		if _, err := readRESPReply(rw.Reader); err != nil {
@@ -93,7 +93,7 @@ func (s *RedisRevocationStore) exec(ctx context.Context, args ...string) (string
 	if err := writeRESPCommand(rw.Writer, args...); err != nil {
 		return "", err
 	}
-	if err := rw.Writer.Flush(); err != nil {
+	if err := rw.Flush(); err != nil {
 		return "", err
 	}
 	return readRESPReply(rw.Reader)

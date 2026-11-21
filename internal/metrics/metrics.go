@@ -20,7 +20,7 @@ var latencyBoundLabels = [...]string{
 
 type histogram struct {
 	buckets [len(latencyBounds) + 1]atomic.Uint64 // last slot is +Inf
-	sumNs   atomic.Uint64
+	sumNs   atomic.Int64
 }
 
 func (h *histogram) observe(d time.Duration) {
@@ -28,7 +28,7 @@ func (h *histogram) observe(d time.Duration) {
 		d = 0
 	}
 	secs := d.Seconds()
-	h.sumNs.Add(uint64(d.Nanoseconds()))
+	h.sumNs.Add(d.Nanoseconds())
 	for i, bound := range latencyBounds {
 		if secs <= bound {
 			h.buckets[i].Add(1)

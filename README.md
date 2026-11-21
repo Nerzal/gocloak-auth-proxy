@@ -202,13 +202,16 @@ http:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CONFIG_FILE` | `""` | Optional path to a strict JSON configuration file (unknown fields rejected; environment variables override file values). |
+| `CONFIG_FILE` | `""` | Optional path to a strict JSON configuration file (unknown fields rejected; environment variables override file values; IDE schema in [`config.schema.json`](config.schema.json)). |
 | `ISSUER` | *(required)* | Exact Keycloak realm issuer URL, e.g. `https://keycloak.example.com/realms/myrealm`. HTTPS required except for localhost/loopback. |
+| `ALLOWED_ISSUERS` | `""` | Optional comma-separated additional Keycloak realm issuer URLs for multi-realm / multi-tenant JWT validation (each with its own JWKS cache & readiness check). |
 | `AUDIENCE` | *(required)* | Expected `aud` claim. Configure an Audience protocol mapper in Keycloak if your tokens only emit `aud: "account"`. |
 | `UPSTREAM_URL` | `""` | Fixed reverse-proxy upstream URL. When omitted, runs in forward-auth mode on `/auth`. |
 | `LISTEN_ADDR` | `:8080` | Proxy listen address (`host:port`). |
 | `CLIENT_ID` | `""` | Keycloak client ID; required for client roles, introspection, or OIDC SSO. |
 | `CLIENT_SECRET` | `""` | Keycloak client secret; required for `INTROSPECTION_ENABLED` and confidential OIDC clients. |
+| `CLIENT_SECRET_FILE` | `""` | Path to a file containing `CLIENT_SECRET` (Kubernetes mounted secrets / Vault Agent; mutually exclusive with `CLIENT_SECRET`). |
+| `TRUSTED_PROXIES` | `""` | Optional comma-separated IP/CIDR allowlist for incoming `X-Forwarded-*` headers (untrusted peers are stripped or rejected). |
 | `ALLOWED_ALGORITHMS` | `RS256,ES256` | Comma-separated allowed JWS algorithms (`RS256/384/512`, `PS256/384/512`, `ES256/384/512`, `EdDSA`). |
 | `JWKS_REFRESH_INTERVAL` | `5m` | Periodic JWKS refresh interval (`1s`–`12h`). |
 | `CLOCK_SKEW` | `30s` | Token validation leeway (`0s`–`30s`). |
