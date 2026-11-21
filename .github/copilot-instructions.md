@@ -1,6 +1,6 @@
 # Project instructions
 
-- Use Go 1.26 or newer. Keep direct dependencies limited to gocloak and
+- Use Go 1.27 or newer. Keep direct dependencies limited to gocloak and
   golang-jwt; prefer the standard library. Transitive SDK dependencies are
   unavoidable.
 - Treat authentication, authorization, proxy headers, and network input as security-sensitive.

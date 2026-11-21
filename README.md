@@ -56,7 +56,7 @@ gh attestation verify oci://ghcr.io/nerzal/gocloak-auth-proxy:v${VERSION} -R Ner
 
 ### Go Install
 
-Requires Go 1.26 or newer:
+Requires Go 1.27 or newer:
 
 ```sh
 go install github.com/Nerzal/gocloak-auth-proxy/cmd/gocloak-auth-proxy@latest
