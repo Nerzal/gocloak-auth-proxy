@@ -14,7 +14,7 @@ linters:
           allow:
             - $gostd
             - github.com/Nerzal/gocloak-auth-proxy/
-            - github.com/Nerzal/gocloak/v14$
-            - github.com/Nerzal/gocloak/v14/
+            - github.com/Nerzal/gocloak/v15$
+            - github.com/Nerzal/gocloak/v15/
             - github.com/golang-jwt/jwt/v5$
             - github.com/golang-jwt/jwt/v5/

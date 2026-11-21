@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/Nerzal/gocloak-auth-proxy/internal/auth"
-	"github.com/Nerzal/gocloak/v14"
+	"github.com/Nerzal/gocloak/v15"
 )
 
 const (
@@ -206,11 +206,11 @@ func (i *Introspector) Active(ctx context.Context, rawToken string) (bool, error
 		res, err := i.client.RetrospectToken(reqCtx, rawToken, i.clientID, i.clientSecret, i.realm)
 		var active bool
 		var retErr error
-		if err != nil || res == nil || res.Active == nil {
+		if err != nil || res == nil {
 			i.record("error")
 			retErr = errors.New("token introspection failed")
 		} else {
-			active = *res.Active
+			active = res.Active
 			if active {
 				i.record("active")
 			} else {
@@ -296,16 +296,12 @@ func (u *UMAAuthorizer) Authorize(ctx context.Context, rawToken, method, reqPath
 	if u.methodScope {
 		perm = reqPath + "#method:" + method
 	}
-	grantType := "urn:ietf:params:oauth:grant-type:uma-ticket"
-	resFormat := "uri"
-	matchURI := true
-	aud := u.audience
 	perms, err := u.client.GetRequestingPartyPermissions(reqCtx, rawToken, u.realm, gocloak.RequestingPartyTokenOptions{
-		GrantType:                     &grantType,
-		Audience:                      &aud,
+		GrantType:                     "urn:ietf:params:oauth:grant-type:uma-ticket",
+		Audience:                      u.audience,
 		Permissions:                   []string{perm},
-		PermissionResourceFormat:      &resFormat,
-		PermissionResourceMatchingURI: &matchURI,
+		PermissionResourceFormat:      "uri",
+		PermissionResourceMatchingURI: true,
 	})
 	if err != nil {
 		var apiErr *gocloak.APIError
@@ -316,7 +312,7 @@ func (u *UMAAuthorizer) Authorize(ctx context.Context, rawToken, method, reqPath
 		u.record("error")
 		return auth.ErrForbidden
 	}
-	if perms == nil || len(*perms) == 0 {
+	if len(perms) == 0 {
 		u.record("denied")
 		return auth.ErrForbidden
 	}
