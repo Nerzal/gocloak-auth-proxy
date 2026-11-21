@@ -273,28 +273,45 @@ Measured with `make bench` (`go test -run '^$' -bench . -benchmem ./...`) on Go 
 
 | Benchmark | Time / Op | Bytes / Op | Allocs / Op | Scope |
 | --- | ---: | ---: | ---: | --- |
-| `BenchmarkPolicy` | `118.8 ns` | `0 B` | `0` | Path normalization + ACL mode + route role check |
-| `BenchmarkIntrospectorCacheHit` | `243.1 ns` | `0 B` | `0` | Parallel `RLock` introspection cache hit (SHA-256 token lookup) |
-| `BenchmarkForwardAuth` | `2.26 µs` | `2416 B` | `25` | Header scrubbing + identity injection (mock verifier + `httptest.ResponseRecorder`) |
-| `BenchmarkReadSession` | `4.26 µs` | `2761 B` | `6` | OIDC in-place AES-256-GCM session cookie decryption & JSON decode |
-| `BenchmarkVerify/RS256` | `37.5 µs` | `6379 B` | `79` | Full RS256 (2048-bit) JWT signature + claims + RBAC verification |
-| `BenchmarkVerifyEdDSA` | `58.6 µs` | `8509 B` | `104` | Full Ed25519 (`EdDSA`) JWT verification + `CUSTOM_CLAIM_HEADERS` extraction |
-| `BenchmarkVerify/ES256` | `75.5 µs` | `5995 B` | `90` | Full ES256 (P-256) JWT signature + claims + RBAC verification |
+| `BenchmarkPolicy` | `125.6 ns` | `0 B` | `0` | Path normalization + ACL mode + route role check |
+| `BenchmarkIntrospectorCacheHit` | `226.7 ns` | `0 B` | `0` | Parallel `RLock` introspection cache hit (SHA-256 token lookup) |
+| `BenchmarkVerifyCached` | `463.1 ns` | `0 B` | `0` | Parallel verified-token cache hit (SHA-256 + `exp`/`nbf` + JWKS key-identity check) |
+| `BenchmarkForwardAuth` | `1.62 µs` | `2336 B` | `17` | Header scrubbing + pre-canonicalized identity injection (`httptest.ResponseRecorder`) |
+| `BenchmarkReadSession` | `2.76 µs` | `1328 B` | `3` | OIDC pooled base64 + in-place AES-256-GCM decrypt + `encoding/json/v2` decode |
+| `BenchmarkVerify/RS256` | `30.0 µs` | `1728 B` | `33` | Cold RS256 (2048-bit) JWS signature + streaming `jsontext` claims + RBAC |
+| `BenchmarkVerifyEdDSA` | `45.5 µs` | `624 B` | `24` | Cold Ed25519 (`EdDSA`) JWS verify + single-pass `CUSTOM_CLAIM_HEADERS` |
+| `BenchmarkVerify/ES256` | `67.7 µs` | `1536 B` | `44` | Cold ES256 (P-256) JWS signature + streaming `jsontext` claims + RBAC |
 
-### Live Head-to-Head Comparison
+### Live Head-to-Head Cross-Language Comparison
 
-Measured on the same machine (`linux/amd64`, Intel Xeon 6985P-C, `GOMAXPROCS=2`, 2048-bit RS256 Bearer JWT, local mock Keycloak JWKS & upstream, access logging disabled, 0 errors across all runs):
+Measured with `make bench-compare` on the same machine (`linux/amd64`, Intel Xeon 6985P-C, `GOMAXPROCS=2`, `C=32`, `D=5s`, 2048-bit RS256 Bearer JWT, local mock Keycloak JWKS & upstream, 0 errors across all runs):
 
-| Proxy | Binary | `go.mod` Deps | Idle RAM | Reverse-Proxy (`C=32`) | Forward-Auth (`C=32`) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **`gocloak-auth-proxy`** | **8.6 MB** | **8** | **9.1 MB** | **8,737 RPS** (`p50 3.36 ms`) | **15,825 RPS** (`p50 1.80 ms`) |
-| `GoGatekeeper v5.1.0` | 39 MB | 104 | 28.4 MB | 4,754 RPS (`p50 6.22 ms`) | 5,801 RPS (`p50 5.04 ms`) |
-| `oauth2-proxy v7.15.6` | 42 MB | 74 | 20.9 MB | 2,851 RPS (`p50 10.55 ms`) | 6,625 RPS (`p50 4.09 ms`) |
+| Proxy | Runtime | Mode | Token Mode | RPS | p50 | p95 | p99 | Idle / Load RSS |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **`gocloak-auth-proxy` (Warm)** | **Go 1.27** | Forward-Auth | Warm | **30,797** | **0.82 ms** | **2.79 ms** | **4.18 ms** | **9.1 / 15.4 MB** |
+| **`gocloak-auth-proxy` (Cold)** | **Go 1.27** | Forward-Auth | Cold (2000) | **18,616** | **1.53 ms** | **4.08 ms** | **5.77 ms** | **9.0 / 15.9 MB** |
+| `rust-auth-proxy` (Axum + `jsonwebtoken`) | Rust 1.100 | Forward-Auth | Cold (2000) | 26,232 | 1.14 ms | 2.28 ms | 3.25 ms | 2.5 / 3.7 MB |
+| `java-auth-proxy` (`HttpServer`) | Java 17 | Forward-Auth | Cold (2000) | 8,876 | 3.16 ms | 7.59 ms | 12.51 ms | 38.2 / 104.4 MB |
+| `oauth2-proxy v7.15.6` | Go | Forward-Auth | Warm | 7,541 | 3.61 ms | 9.88 ms | 14.92 ms | 19.8 / 27.3 MB |
+| `python-auth-proxy` (Uvicorn + PyJWT) | Python 3.11 | Forward-Auth | Cold (2000) | 5,567 | 5.34 ms | 10.21 ms | 12.23 ms | 14.7 MB (master) |
+| **`gocloak-auth-proxy` (Warm)** | **Go 1.27** | Reverse-Proxy | Warm | **13,288** | **2.11 ms** | **5.02 ms** | **6.80 ms** | **9.1 / 16.3 MB** |
+| **`gocloak-auth-proxy` (Cold)** | **Go 1.27** | Reverse-Proxy | Cold (2000) | **9,922** | **2.91 ms** | **6.32 ms** | **8.44 ms** | **9.0 / 16.2 MB** |
+| `rust-auth-proxy` (Axum + `reqwest`) | Rust 1.100 | Reverse-Proxy | Cold (2000) | 12,385 | 2.42 ms | 4.41 ms | 5.55 ms | 2.4 / 6.1 MB |
+| `oauth2-proxy v7.15.6` | Go | Reverse-Proxy | Warm | 2,713 | 11.05 ms | 22.66 ms | 28.75 ms | 19.8 / 27.8 MB |
+| `java-auth-proxy` (`HttpClient`) | Java 17 | Reverse-Proxy | Cold (2000) | 1,421 | 20.01 ms | 41.15 ms | 50.29 ms | 37.8 / 112.2 MB |
+| `python-auth-proxy` (Uvicorn + `httpx`) | Python 3.11 | Reverse-Proxy | Cold (2000) | 837 | 17.18 ms | 129.99 ms | 210.00 ms | 14.7 MB (master) |
 
-Run locally to reproduce Go microbenchmarks on your hardware:
+### Running Benchmarks & Profiles Locally
 
 ```sh
-make bench
+make bench            # Go microbenchmarks with allocation stats
+make bench-profile    # Capture CPU & memory pprof profiles + top summaries
+make bench-isolated   # Isolated live HTTP benchmark (gocloak-auth-proxy Warm & Cold)
+make bench-compare    # Cross-language benchmark (Go, Rust, Java, Python)
+
+# Non-isolated benchmark against a real Keycloak 26 instance:
+docker compose -f bench/docker-compose.keycloak.yml up -d
+make bench-keycloak
 ```
 
 ---

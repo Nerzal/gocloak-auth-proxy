@@ -7,17 +7,14 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
-
-	"github.com/golang-jwt/jwt/v5"
 )
 
 // Identity contains the values suitable for forwarding as identity headers.
@@ -48,75 +45,6 @@ var ErrForbidden = errors.New("insufficient permissions")
 
 var errInvalid = errors.New("invalid authorization")
 
-type roleClaims struct {
-	Roles []string `json:"roles"`
-}
-
-// orgClaim handles Keycloak 26+ organization claims whether encoded as a string,
-// string slice, or object map keyed by organization alias.
-type orgClaim []string
-
-func (o *orgClaim) UnmarshalJSON(data []byte) error {
-	i := 0
-	for i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\r' || data[i] == '\n') {
-		i++
-	}
-	if i == len(data) {
-		return nil
-	}
-	switch data[i] {
-	case 'n':
-		if string(data[i:]) == "null" {
-			return nil
-		}
-	case '"':
-		var single string
-		if err := json.Unmarshal(data[i:], &single); err != nil {
-			return err
-		}
-		if single != "" {
-			*o = []string{single}
-		}
-		return nil
-	case '[':
-		var list []string
-		if err := json.Unmarshal(data[i:], &list); err != nil {
-			return err
-		}
-		*o = list
-		return nil
-	case '{':
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(data[i:], &obj); err != nil {
-			return err
-		}
-		names := make([]string, 0, len(obj))
-		for k := range obj {
-			names = append(names, k)
-		}
-		*o = names
-		return nil
-	}
-	return errors.New("invalid organization claim")
-}
-
-type claims struct {
-	jwt.RegisteredClaims
-	Type           string                `json:"typ"`
-	SID            string                `json:"sid"`
-	Username       string                `json:"preferred_username"`
-	Email          string                `json:"email"`
-	EmailVerified  bool                  `json:"email_verified"`
-	AZP            string                `json:"azp"`
-	Scope          string                `json:"scope"`
-	ACR            string                `json:"acr"`
-	AMR            []string              `json:"amr"`
-	Organization   orgClaim              `json:"organization"`
-	Groups         []string              `json:"groups"`
-	RealmAccess    roleClaims            `json:"realm_access"`
-	ResourceAccess map[string]roleClaims `json:"resource_access"`
-}
-
 // Options configures JWT verification and authorization policies.
 type Options struct {
 	Issuer               string
@@ -137,12 +65,78 @@ type Options struct {
 	RequiredOrganization string
 	CustomClaimHeaders   map[string]string
 	Introspector         TokenIntrospector
+	// TokenCacheSize enables a bounded, SHA-256-keyed verified-token cache that
+	// re-checks exp/nbf, JWKS key identity, and online introspection on every hit.
+	// Zero disables caching (full cryptographic verification on every call).
+	TokenCacheSize int
+}
+
+const tokenCacheShards = 16
+
+type cachedVerification struct {
+	kid      string
+	alg      string
+	key      any
+	exp      float64
+	nbf      float64
+	hasNbf   bool
+	identity Identity
+}
+
+type tokenCacheShard struct {
+	mu      sync.RWMutex
+	entries map[[32]byte]cachedVerification
+}
+
+type verifiedTokenCache struct {
+	maxPerShard int
+	shards      [tokenCacheShards]tokenCacheShard
+}
+
+func newVerifiedTokenCache(maxEntries int) *verifiedTokenCache {
+	if maxEntries <= 0 {
+		return nil
+	}
+	perShard := max(maxEntries/tokenCacheShards, 16)
+	c := &verifiedTokenCache{maxPerShard: perShard}
+	for i := range c.shards {
+		c.shards[i].entries = make(map[[32]byte]cachedVerification, min(perShard, 64))
+	}
+	return c
+}
+
+func (c *verifiedTokenCache) get(hash [32]byte) (cachedVerification, bool) {
+	shard := &c.shards[hash[0]&(tokenCacheShards-1)]
+	shard.mu.RLock()
+	entry, ok := shard.entries[hash]
+	shard.mu.RUnlock()
+	return entry, ok
+}
+
+func (c *verifiedTokenCache) set(hash [32]byte, entry cachedVerification, nowSec, skewSec float64) {
+	shard := &c.shards[hash[0]&(tokenCacheShards-1)]
+	shard.mu.Lock()
+	if len(shard.entries) >= c.maxPerShard {
+		for k, e := range shard.entries {
+			if nowSec > e.exp+skewSec {
+				delete(shard.entries, k)
+			}
+		}
+		if len(shard.entries) >= c.maxPerShard {
+			shard.entries = make(map[[32]byte]cachedVerification, min(c.maxPerShard, 64))
+		}
+	}
+	shard.entries[hash] = entry
+	shard.mu.Unlock()
 }
 
 // Verifier validates JWTs using a configured key source and authorization policy.
 type Verifier struct {
 	keys                 KeySource
-	parser               *jwt.Parser
+	issuer               string
+	audience             string
+	skewSec              float64
+	allowedAlgs          []string
 	realmRoles           []string
 	clientRoles          []string
 	clientID             string
@@ -155,8 +149,9 @@ type Verifier struct {
 	requireEmailVerified bool
 	requiredAZP          string
 	requiredOrg          string
-	customClaims         map[string]string
+	customByClaim        map[string][]string
 	introspector         TokenIntrospector
+	tokenCache           *verifiedTokenCache
 }
 
 func isAllowedAlgorithm(alg string) bool {
@@ -206,24 +201,22 @@ func NewWithOptions(keys KeySource, opts Options) (*Verifier, error) {
 			}
 		}
 	}
-	var custom map[string]string
+	var customByClaim map[string][]string
 	if len(opts.CustomClaimHeaders) > 0 {
-		custom = make(map[string]string, len(opts.CustomClaimHeaders))
+		customByClaim = make(map[string][]string, len(opts.CustomClaimHeaders))
 		for header, claim := range opts.CustomClaimHeaders {
 			if strings.TrimSpace(header) == "" || strings.TrimSpace(claim) == "" {
 				return nil, errors.New("invalid custom claim header mapping")
 			}
-			custom[header] = claim
+			customByClaim[claim] = append(customByClaim[claim], header)
 		}
 	}
 	return &Verifier{
-		keys: keys,
-		parser: jwt.NewParser(
-			jwt.WithValidMethods(algs),
-			jwt.WithIssuer(opts.Issuer), jwt.WithAudience(opts.Audience),
-			jwt.WithExpirationRequired(),
-			jwt.WithIssuedAt(), jwt.WithLeeway(opts.ClockSkew), jwt.WithStrictDecoding(),
-		),
+		keys:                 keys,
+		issuer:               opts.Issuer,
+		audience:             opts.Audience,
+		skewSec:              opts.ClockSkew.Seconds(),
+		allowedAlgs:          algs,
 		realmRoles:           append([]string(nil), opts.RequiredRealmRoles...),
 		clientRoles:          append([]string(nil), opts.RequiredClientRoles...),
 		clientID:             opts.ClientID,
@@ -236,8 +229,9 @@ func NewWithOptions(keys KeySource, opts Options) (*Verifier, error) {
 		requireEmailVerified: opts.RequireEmailVerified,
 		requiredAZP:          opts.RequiredAZP,
 		requiredOrg:          opts.RequiredOrganization,
-		customClaims:         custom,
+		customByClaim:        customByClaim,
 		introspector:         opts.Introspector,
+		tokenCache:           newVerifiedTokenCache(opts.TokenCacheSize),
 	}, nil
 }
 
@@ -248,23 +242,80 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Identity, 
 	if !ok || !strings.EqualFold(scheme, "Bearer") || len(raw) == 0 || len(raw) > 65536 {
 		return Identity{}, errInvalid
 	}
-	for _, c := range raw {
-		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_' && c != '.' {
+
+	var tokenHash [32]byte
+	if v.tokenCache != nil {
+		tokenHash = sha256String(raw)
+		if entry, hit := v.tokenCache.get(tokenHash); hit {
+			nowSec := float64(time.Now().UnixNano()) / 1e9
+			if nowSec <= entry.exp+v.skewSec && (!entry.hasNbf || nowSec+v.skewSec >= entry.nbf) {
+				if curKey, err := v.keys.Key(ctx, entry.kid, entry.alg); err == nil && samePublicKey(curKey, entry.key) {
+					if v.introspector != nil {
+						active, err := v.introspector.Active(ctx, raw)
+						if err != nil || !active {
+							return Identity{}, errInvalid
+						}
+					}
+					return entry.identity, nil
+				}
+			}
+		}
+	}
+
+	hdrPart, payloadPart, sigPart, signingInput, ok := splitJWT(raw)
+	if !ok {
+		return Identity{}, errInvalid
+	}
+
+	db := getDecodeBuf()
+	defer putDecodeBuf(db)
+
+	alg, kid, err := parseJWSHeader(db, hdrPart)
+	if err != nil || !slices.Contains(v.allowedAlgs, alg) || kid == "" || len(kid) > 256 || !safeHeaderValue(kid) {
+		return Identity{}, errInvalid
+	}
+
+	key, err := v.keys.Key(ctx, kid, alg)
+	if err != nil || !validPublicKey(alg, key) {
+		return Identity{}, errInvalid
+	}
+
+	if err := verifyJWSSignature(alg, key, signingInput, sigPart, db); err != nil {
+		return Identity{}, errInvalid
+	}
+
+	c, err := parseJWTPayload(db, payloadPart, v.clientID, v.customByClaim)
+	if err != nil {
+		return Identity{}, errInvalid
+	}
+	if len(v.customByClaim) > 0 {
+		if err := populateStandardCustomClaims(&c, v.customByClaim); err != nil {
 			return Identity{}, errInvalid
 		}
 	}
 
-	var c claims
-	token, err := v.parser.ParseWithClaims(raw, &c, func(t *jwt.Token) (any, error) {
-		return v.key(ctx, t)
-	})
-	if err != nil || token == nil || !token.Valid || c.IssuedAt == nil || c.Type != "Bearer" {
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	if !v.validRegisteredClaims(c, nowSec) {
 		return Identity{}, errInvalid
 	}
+
 	id, err := v.identity(c, raw)
 	if err != nil {
 		return Identity{}, err
 	}
+
+	if v.tokenCache != nil {
+		v.tokenCache.set(tokenHash, cachedVerification{
+			kid:      kid,
+			alg:      alg,
+			key:      key,
+			exp:      c.exp,
+			nbf:      c.nbf,
+			hasNbf:   c.hasNbf,
+			identity: id,
+		}, nowSec, v.skewSec)
+	}
+
 	if v.introspector != nil {
 		active, err := v.introspector.Active(ctx, raw)
 		if err != nil || !active {
@@ -274,201 +325,195 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Identity, 
 	return id, nil
 }
 
-func (v *Verifier) key(ctx context.Context, t *jwt.Token) (any, error) {
-	kid, ok := t.Header["kid"].(string)
-	if !ok || kid == "" || len(kid) > 256 || !safeHeaderValue(kid) {
-		return nil, errInvalid
-	}
-	// No critical, unencoded-payload, or embedded/remote key extensions are supported.
-	for _, forbidden := range [5]string{"crit", "b64", "jku", "x5u", "jwk"} {
-		if _, ok := t.Header[forbidden]; ok {
-			return nil, errInvalid
-		}
-	}
-	alg := t.Method.Alg()
-	key, err := v.keys.Key(ctx, kid, alg)
-	if err != nil {
-		return nil, errInvalid
-	}
-	switch alg {
-	case "RS256", "RS384", "RS512", "PS256", "PS384", "PS512":
-		k, ok := key.(*rsa.PublicKey)
-		if !ok || k == nil || k.N == nil || k.N.Sign() <= 0 || k.E < 3 || k.E%2 == 0 {
-			return nil, errInvalid
-		}
-	case "ES256":
-		k, ok := key.(*ecdsa.PublicKey)
-		//nolint:staticcheck // Guard against nil coordinates that panic inside crypto/ecdsa.Verify.
-		if !ok || k == nil || k.Curve != elliptic.P256() || k.X == nil || k.Y == nil {
-			return nil, errInvalid
-		}
-	case "ES384":
-		k, ok := key.(*ecdsa.PublicKey)
-		//nolint:staticcheck // Guard against nil coordinates that panic inside crypto/ecdsa.Verify.
-		if !ok || k == nil || k.Curve != elliptic.P384() || k.X == nil || k.Y == nil {
-			return nil, errInvalid
-		}
-	case "ES512":
-		k, ok := key.(*ecdsa.PublicKey)
-		//nolint:staticcheck // Guard against nil coordinates that panic inside crypto/ecdsa.Verify.
-		if !ok || k == nil || k.Curve != elliptic.P521() || k.X == nil || k.Y == nil {
-			return nil, errInvalid
-		}
-	case "EdDSA":
-		k, ok := key.(ed25519.PublicKey)
-		if !ok || len(k) != ed25519.PublicKeySize {
-			return nil, errInvalid
-		}
-	default:
-		return nil, errInvalid
-	}
-	return key, nil
-}
-
-func (v *Verifier) identity(c claims, raw string) (Identity, error) {
-	user := c.Username
-	if user == "" {
-		user = c.Subject
-	}
-	if strings.TrimSpace(user) == "" {
-		return Identity{}, errInvalid
-	}
-	var client []string
-	if v.clientID != "" {
-		client = c.ResourceAccess[v.clientID].Roles
-	}
-	roles := uniqueRoles(c.RealmAccess.Roles, client)
-	if !safeHeaderValue(user) || !safeHeaderValue(c.Email) || !safeValues(c.Groups) || !safeValues(roles) {
-		return Identity{}, errInvalid
-	}
-	if !v.authorize(c, client) {
-		return Identity{}, ErrForbidden
-	}
-	var extra map[string]string
-	if len(v.customClaims) > 0 {
-		var err error
-		extra, err = extractCustomClaims(raw, v.customClaims)
-		if err != nil {
-			return Identity{}, errInvalid
-		}
-	}
-	return Identity{
-		User:        user,
-		Email:       c.Email,
-		Subject:     c.Subject,
-		SID:         c.SID,
-		ACR:         c.ACR,
-		AMR:         c.AMR,
-		Groups:      c.Groups,
-		Roles:       roles,
-		RealmRoles:  c.RealmAccess.Roles,
-		ClientRoles: client,
-		Extra:       extra,
-		RawToken:    raw,
-	}, nil
-}
-
-func (v *Verifier) authorize(c claims, clientRoles []string) bool {
-	if !matchValues(c.RealmAccess.Roles, v.realmRoles, v.requireAnyRole) {
+func (v *Verifier) validRegisteredClaims(c parsedClaims, nowSec float64) bool {
+	if c.typ != "Bearer" || c.issuer != v.issuer || !slices.Contains(c.audience, v.audience) {
 		return false
 	}
-	if !matchValues(clientRoles, v.clientRoles, v.requireAnyRole) {
+	if !c.hasExp || !c.hasIat {
 		return false
 	}
-	if !matchValues(c.Groups, v.requiredGroups, v.requireAnyGroup) {
+	if nowSec > c.exp+v.skewSec {
 		return false
 	}
-	if len(v.requiredScopes) > 0 {
-		tokenScopes := strings.Fields(c.Scope)
-		if !matchValues(tokenScopes, v.requiredScopes, false) {
-			return false
-		}
-	}
-	if len(v.requiredACR) > 0 && !slices.Contains(v.requiredACR, c.ACR) {
+	if c.iat > nowSec+v.skewSec {
 		return false
 	}
-	if len(v.requiredAMR) > 0 && !matchValues(c.AMR, v.requiredAMR, false) {
-		return false
-	}
-	if v.requireEmailVerified && !c.EmailVerified {
-		return false
-	}
-	if v.requiredAZP != "" && c.AZP != v.requiredAZP {
-		return false
-	}
-	if v.requiredOrg != "" && !slices.Contains([]string(c.Organization), v.requiredOrg) {
+	if c.hasNbf && c.nbf > nowSec+v.skewSec {
 		return false
 	}
 	return true
 }
 
-func extractCustomClaims(raw string, mapping map[string]string) (map[string]string, error) {
-	first := strings.IndexByte(raw, '.')
-	if first < 0 {
-		return nil, errInvalid
+func validPublicKey(alg string, key any) bool {
+	switch alg {
+	case "RS256", "RS384", "RS512", "PS256", "PS384", "PS512":
+		k, ok := key.(*rsa.PublicKey)
+		return ok && k != nil && k.N != nil && k.N.Sign() > 0 && k.E >= 3 && k.E%2 != 0
+	case "ES256":
+		k, ok := key.(*ecdsa.PublicKey)
+		//nolint:staticcheck // Guard against nil coordinates that panic inside crypto/ecdsa.Verify.
+		return ok && k != nil && k.Curve == elliptic.P256() && k.X != nil && k.Y != nil
+	case "ES384":
+		k, ok := key.(*ecdsa.PublicKey)
+		//nolint:staticcheck // Guard against nil coordinates that panic inside crypto/ecdsa.Verify.
+		return ok && k != nil && k.Curve == elliptic.P384() && k.X != nil && k.Y != nil
+	case "ES512":
+		k, ok := key.(*ecdsa.PublicKey)
+		//nolint:staticcheck // Guard against nil coordinates that panic inside crypto/ecdsa.Verify.
+		return ok && k != nil && k.Curve == elliptic.P521() && k.X != nil && k.Y != nil
+	case "EdDSA":
+		k, ok := key.(ed25519.PublicKey)
+		return ok && len(k) == ed25519.PublicKeySize
+	default:
+		return false
 	}
-	rest := raw[first+1:]
-	second := strings.IndexByte(rest, '.')
-	if second < 0 {
-		return nil, errInvalid
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(rest[:second])
-	if err != nil {
-		return nil, errInvalid
-	}
-	var rawClaims map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &rawClaims); err != nil {
-		return nil, errInvalid
-	}
-	extra := make(map[string]string, len(mapping))
-	for header, claimKey := range mapping {
-		rawVal, ok := rawClaims[claimKey]
-		if !ok || len(rawVal) == 0 || string(rawVal) == "null" {
-			continue
-		}
-		str, ok := decodeClaimValue(rawVal)
-		if !ok || !safeHeaderValue(str) {
-			return nil, errInvalid
-		}
-		extra[header] = str
-	}
-	return extra, nil
 }
 
-func decodeClaimValue(raw json.RawMessage) (string, bool) {
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return "", false
-	}
-	switch t := v.(type) {
-	case string:
-		return t, true
-	case bool:
-		return strconv.FormatBool(t), true
-	case float64:
-		return strconv.FormatFloat(t, 'f', -1, 64), true
-	case []any:
-		parts := make([]string, 0, len(t))
-		for _, elem := range t {
-			s, ok := elem.(string)
-			if !ok || s == "" || strings.Contains(s, ",") || !safeHeaderValue(s) {
-				return "", false
-			}
-			parts = append(parts, s)
-		}
-		return strings.Join(parts, ","), true
+func samePublicKey(a, b any) bool {
+	switch ka := a.(type) {
+	case *rsa.PublicKey:
+		kb, ok := b.(*rsa.PublicKey)
+		return ok && ka == kb
+	case *ecdsa.PublicKey:
+		kb, ok := b.(*ecdsa.PublicKey)
+		return ok && ka == kb
+	case ed25519.PublicKey:
+		kb, ok := b.(ed25519.PublicKey)
+		return ok && ka.Equal(kb)
 	default:
-		return "", false
+		return false
 	}
+}
+
+func populateStandardCustomClaims(c *parsedClaims, customByClaim map[string][]string) error {
+	for claimKey, headers := range customByClaim {
+		var val string
+		var matched bool
+		switch claimKey {
+		case "iss":
+			val, matched = c.issuer, c.issuer != ""
+		case "sub":
+			val, matched = c.subject, c.subject != ""
+		case "sid":
+			val, matched = c.sid, c.sid != ""
+		case "preferred_username":
+			val, matched = c.username, c.username != ""
+		case "email":
+			val, matched = c.email, c.email != ""
+		case "email_verified":
+			val, matched = strconv.FormatBool(c.emailVerified), true
+		case "azp":
+			val, matched = c.azp, c.azp != ""
+		case "scope":
+			val, matched = c.scope, c.scope != ""
+		case "acr":
+			val, matched = c.acr, c.acr != ""
+		default:
+			continue
+		}
+		if !matched {
+			continue
+		}
+		if !safeHeaderValue(val) {
+			return errInvalid
+		}
+		if c.extra == nil {
+			c.extra = make(map[string]string, len(customByClaim))
+		}
+		for _, h := range headers {
+			c.extra[h] = val
+		}
+	}
+	return nil
+}
+
+func (v *Verifier) identity(c parsedClaims, raw string) (Identity, error) {
+	user := c.username
+	if user == "" {
+		user = c.subject
+	}
+	if strings.TrimSpace(user) == "" {
+		return Identity{}, errInvalid
+	}
+	roles := uniqueRoles(c.realmRoles, c.clientRoles)
+	if !safeHeaderValue(user) || !safeHeaderValue(c.email) || !safeValues(c.groups) || !safeValues(roles) {
+		return Identity{}, errInvalid
+	}
+	if !v.authorize(c) {
+		return Identity{}, ErrForbidden
+	}
+	return Identity{
+		User:        user,
+		Email:       c.email,
+		Subject:     c.subject,
+		SID:         c.sid,
+		ACR:         c.acr,
+		AMR:         c.amr,
+		Groups:      c.groups,
+		Roles:       roles,
+		RealmRoles:  c.realmRoles,
+		ClientRoles: c.clientRoles,
+		Extra:       c.extra,
+		RawToken:    raw,
+	}, nil
+}
+
+func (v *Verifier) authorize(c parsedClaims) bool {
+	if !matchValues(c.realmRoles, v.realmRoles, v.requireAnyRole) {
+		return false
+	}
+	if !matchValues(c.clientRoles, v.clientRoles, v.requireAnyRole) {
+		return false
+	}
+	if !matchValues(c.groups, v.requiredGroups, v.requireAnyGroup) {
+		return false
+	}
+	if len(v.requiredScopes) > 0 {
+		tokenScopes := strings.Fields(c.scope)
+		if !matchValues(tokenScopes, v.requiredScopes, false) {
+			return false
+		}
+	}
+	if len(v.requiredACR) > 0 && !slices.Contains(v.requiredACR, c.acr) {
+		return false
+	}
+	if len(v.requiredAMR) > 0 && !matchValues(c.amr, v.requiredAMR, false) {
+		return false
+	}
+	if v.requireEmailVerified && !c.emailVerified {
+		return false
+	}
+	if v.requiredAZP != "" && c.azp != v.requiredAZP {
+		return false
+	}
+	if v.requiredOrg != "" && !slices.Contains(c.organization, v.requiredOrg) {
+		return false
+	}
+	return true
 }
 
 func safeHeaderValue(s string) bool {
-	if strings.TrimSpace(s) != s {
+	if len(s) == 0 {
+		return true
+	}
+	if s[0] <= ' ' || s[len(s)-1] <= ' ' {
 		return false
 	}
-	for _, r := range s {
-		if unicode.IsControl(r) {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b == 0x7f {
 			return false
+		}
+		if b >= 0x80 {
+			if strings.TrimSpace(s) != s {
+				return false
+			}
+			for _, r := range s[i:] {
+				if unicode.IsControl(r) {
+					return false
+				}
+			}
+			return true
 		}
 	}
 	return true
@@ -519,6 +564,12 @@ func uniqueRoles(realm, client []string) []string {
 	total := len(realm) + len(client)
 	if total == 0 {
 		return nil
+	}
+	if len(client) == 0 {
+		// Fast path: check if realm roles are already unique without allocating.
+		if len(realm) <= 1 {
+			return realm
+		}
 	}
 	roles := make([]string, 0, total)
 	if total <= 8 {

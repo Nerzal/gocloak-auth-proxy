@@ -439,3 +439,88 @@ func BenchmarkVerifyEdDSA(b *testing.B) {
 		}
 	}
 }
+
+type rotatingKeySource struct {
+	key any
+}
+
+func (r *rotatingKeySource) Key(_ context.Context, _, _ string) (any, error) {
+	if r.key == nil {
+		return nil, errors.New("key removed")
+	}
+	return r.key, nil
+}
+
+func TestVerifyTokenCacheAndKeyRotation(t *testing.T) {
+	rsaKey1, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaKey2, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks := &rotatingKeySource{key: &rsaKey1.PublicKey}
+	v, err := NewWithOptions(ks, Options{
+		Issuer:             "issuer",
+		Audience:           "audience",
+		RequiredRealmRoles: []string{"reader"},
+		TokenCacheSize:     128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := signed(t, jwt.SigningMethodRS256, rsaKey1, validClaims(), nil)
+
+	// Cold verify populates cache.
+	id1, err := v.Verify(context.Background(), token)
+	if err != nil || id1.User != "alice" {
+		t.Fatalf("cold verify failed: %#v %v", id1, err)
+	}
+	// Warm verify hits cache.
+	id2, err := v.Verify(context.Background(), token)
+	if err != nil || id2.User != "alice" {
+		t.Fatalf("warm verify failed: %#v %v", id2, err)
+	}
+	// Rotating the JWKS key immediately invalidates cached entry.
+	ks.key = &rsaKey2.PublicKey
+	if _, err := v.Verify(context.Background(), token); err == nil {
+		t.Fatal("cached token must be rejected immediately after key rotation")
+	}
+	// Removing the key also fails closed.
+	ks.key = nil
+	if _, err := v.Verify(context.Background(), token); err == nil {
+		t.Fatal("cached token must be rejected after key removal")
+	}
+}
+
+func BenchmarkVerifyCached(b *testing.B) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		b.Fatal(err)
+	}
+	v, err := NewWithOptions(testKeys{key: &rsaKey.PublicKey}, Options{
+		Issuer:              "issuer",
+		Audience:            "audience",
+		RequiredRealmRoles:  []string{"reader"},
+		RequiredClientRoles: []string{"writer"},
+		ClientID:            "app",
+		TokenCacheSize:      4096,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	token := signed(b, jwt.SigningMethodRS256, rsaKey, validClaims(), nil)
+	if _, err := v.Verify(context.Background(), token); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := v.Verify(context.Background(), token); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

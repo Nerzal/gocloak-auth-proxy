@@ -1,0 +1,52 @@
+{
+  "realm": "bench",
+  "enabled": true,
+  "roles": {
+    "realm": [
+      { "name": "reader" },
+      { "name": "user" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "bench-api",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "bench-secret",
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": true,
+      "redirectUris": ["http://localhost:*"],
+      "protocolMappers": [
+        {
+          "name": "audience-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "bench-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "benchuser",
+      "enabled": true,
+      "email": "alice@example.test",
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "benchpass",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["reader", "user"]
+    }
+  ]
+}

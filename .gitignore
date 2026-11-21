@@ -36,3 +36,8 @@ go.work.sum
 # Local build artifacts
 /gocloak-auth-proxy
 /bin/
+
+bench/competitors/rust-proxy/target/
+bench/benchrun
+__pycache__/
+*.pyc

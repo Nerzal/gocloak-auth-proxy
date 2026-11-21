@@ -41,6 +41,7 @@ type Config struct {
 	RequiredOrganization string
 	JWKSRefreshInterval  time.Duration
 	ClockSkew            time.Duration
+	TokenCacheSize       int
 
 	// TLS & Timeouts (Milestone 1 + mTLS)
 	KeycloakCAFile          string
@@ -90,6 +91,7 @@ func Load() (Config, error) {
 		LogLevel:                "info",
 		JWKSRefreshInterval:     5 * time.Minute,
 		ClockSkew:               30 * time.Second,
+		TokenCacheSize:          4096,
 		ServerReadHeaderTimeout: 5 * time.Second,
 		ServerReadTimeout:       15 * time.Second,
 		ServerWriteTimeout:      30 * time.Second,
@@ -248,6 +250,13 @@ func Load() (Config, error) {
 			return Config{}, err
 		}
 		c.DisableUpstreamTimeout = (c.UpstreamRequestTimeout == 0)
+	}
+	if v := strings.TrimSpace(os.Getenv("TOKEN_CACHE_SIZE")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 100000 {
+			return Config{}, errors.New("TOKEN_CACHE_SIZE must be an integer between 0 and 100000")
+		}
+		c.TokenCacheSize = n
 	}
 	if err = c.Validate(); err != nil {
 		return Config{}, err

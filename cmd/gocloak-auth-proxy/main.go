@@ -118,6 +118,7 @@ func buildHandler(cfg config.Config, logger *slog.Logger, reg *metrics.Registry)
 		RequiredOrganization: cfg.RequiredOrganization,
 		CustomClaimHeaders:   cfg.CustomClaimHeaders,
 		Introspector:         introspector,
+		TokenCacheSize:       cfg.TokenCacheSize,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid authentication configuration: %w", err)
