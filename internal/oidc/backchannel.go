@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -112,7 +113,6 @@ func (m *Manager) revoke(sid, sub string) {
 	now := time.Now()
 	exp := now.Add(m.sessionMaxAge)
 	m.revokeMu.Lock()
-	defer m.revokeMu.Unlock()
 	if len(m.revokedSIDs) >= maxRevokedEntries {
 		for k, v := range m.revokedSIDs {
 			if !now.Before(v) {
@@ -147,6 +147,21 @@ func (m *Manager) revoke(sid, sub string) {
 		// a single browser session does not terminate unrelated sessions.
 		m.revokedSubs[sub] = now
 	}
+	m.revokeMu.Unlock()
+
+	if m.revocationStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if sid != "" {
+			if err := m.revocationStore.Revoke(ctx, "sid:"+sid, "1", m.sessionMaxAge); err != nil {
+				m.logger.Warn("shared revocation store write failed")
+			}
+		} else if sub != "" {
+			if err := m.revocationStore.Revoke(ctx, "sub:"+sub, strconv.FormatInt(now.Unix(), 10), m.sessionMaxAge); err != nil {
+				m.logger.Warn("shared revocation store write failed")
+			}
+		}
+	}
 }
 
 func (m *Manager) isRevoked(sid, sub string, issuedAt int64) bool {
@@ -155,9 +170,9 @@ func (m *Manager) isRevoked(sid, sub string, issuedAt int64) bool {
 	}
 	now := time.Now()
 	m.revokeMu.RLock()
-	defer m.revokeMu.RUnlock()
 	if sid != "" {
 		if exp, ok := m.revokedSIDs[sid]; ok && now.Before(exp) {
+			m.revokeMu.RUnlock()
 			return true
 		}
 	}
@@ -166,8 +181,29 @@ func (m *Manager) isRevoked(sid, sub string, issuedAt int64) bool {
 			// Only invalidate sessions created at or before the revocation event
 			// so a subsequent re-login succeeds immediately.
 			if issuedAt == 0 || issuedAt <= revokedAt.Unix() {
+				m.revokeMu.RUnlock()
 				return true
 			}
+		}
+	}
+	m.revokeMu.RUnlock()
+	if m.revocationStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		var sidKey, subKey string
+		if sid != "" {
+			sidKey = "sid:" + sid
+		}
+		if sub != "" {
+			subKey = "sub:" + sub
+		}
+		revoked, err := m.revocationStore.IsRevoked(ctx, sidKey, subKey, issuedAt)
+		if err != nil {
+			m.logger.Warn("shared revocation store check failed; failing closed")
+			return true
+		}
+		if revoked {
+			return true
 		}
 	}
 	return false

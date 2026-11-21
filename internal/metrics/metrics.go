@@ -3,11 +3,54 @@ package metrics
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"sync/atomic"
+	"time"
 )
 
-// Registry holds lock-free atomic counters for proxy operations.
+// latencyBounds defines upper bounds (in seconds) for Prometheus request duration histograms.
+var latencyBounds = [...]float64{
+	0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+}
+
+var latencyBoundLabels = [...]string{
+	"0.0005", "0.001", "0.0025", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1",
+}
+
+type histogram struct {
+	buckets [len(latencyBounds) + 1]atomic.Uint64 // last slot is +Inf
+	sumNs   atomic.Int64
+}
+
+func (h *histogram) observe(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	secs := d.Seconds()
+	h.sumNs.Add(d.Nanoseconds())
+	for i, bound := range latencyBounds {
+		if secs <= bound {
+			h.buckets[i].Add(1)
+			return
+		}
+	}
+	h.buckets[len(latencyBounds)].Add(1)
+}
+
+func (h *histogram) writePrometheus(w io.Writer, mode string) {
+	var cumulative uint64
+	for i, label := range latencyBoundLabels {
+		cumulative += h.buckets[i].Load()
+		_, _ = fmt.Fprintf(w, "gocloak_auth_proxy_request_duration_seconds_bucket{mode=%q,le=%q} %d\n", mode, label, cumulative)
+	}
+	cumulative += h.buckets[len(latencyBounds)].Load()
+	_, _ = fmt.Fprintf(w, "gocloak_auth_proxy_request_duration_seconds_bucket{mode=%q,le=\"+Inf\"} %d\n", mode, cumulative)
+	_, _ = fmt.Fprintf(w, "gocloak_auth_proxy_request_duration_seconds_sum{mode=%q} %.9f\n", mode, float64(h.sumNs.Load())/1e9)
+	_, _ = fmt.Fprintf(w, "gocloak_auth_proxy_request_duration_seconds_count{mode=%q} %d\n", mode, cumulative)
+}
+
+// Registry holds lock-free atomic counters and histograms for proxy operations.
 type Registry struct {
 	forwardAllowed      atomic.Uint64
 	forwardUnauthorized atomic.Uint64
@@ -19,6 +62,9 @@ type Registry struct {
 	reverseForbidden    atomic.Uint64
 	reverseBadGateway   atomic.Uint64
 	reversePublic       atomic.Uint64
+
+	forwardDuration histogram
+	reverseDuration histogram
 
 	jwksSuccess atomic.Uint64
 	jwksError   atomic.Uint64
@@ -72,6 +118,19 @@ func (r *Registry) RecordRequest(mode, result string) {
 		case "public":
 			r.reversePublic.Add(1)
 		}
+	}
+}
+
+// RecordDuration observes a request duration in the lock-free Prometheus histogram.
+func (r *Registry) RecordDuration(mode string, d time.Duration) {
+	if r == nil {
+		return
+	}
+	switch mode {
+	case "forward_auth":
+		r.forwardDuration.observe(d)
+	case "reverse_proxy":
+		r.reverseDuration.observe(d)
 	}
 }
 
@@ -197,7 +256,9 @@ func (r *Registry) Handler() http.Handler {
 				"gocloak_auth_proxy_oidc_events_total{result=\"success\"} %d\n"+
 				"gocloak_auth_proxy_oidc_events_total{result=\"error\"} %d\n"+
 				"gocloak_auth_proxy_oidc_events_total{result=\"refreshed\"} %d\n"+
-				"gocloak_auth_proxy_oidc_events_total{result=\"logout\"} %d\n",
+				"gocloak_auth_proxy_oidc_events_total{result=\"logout\"} %d\n"+
+				"# HELP gocloak_auth_proxy_request_duration_seconds Request processing latency histogram.\n"+
+				"# TYPE gocloak_auth_proxy_request_duration_seconds histogram\n",
 			r.forwardAllowed.Load(), r.forwardUnauthorized.Load(), r.forwardForbidden.Load(), r.forwardPublic.Load(),
 			r.reverseAllowed.Load(), r.reverseUnauthorized.Load(), r.reverseForbidden.Load(), r.reverseBadGateway.Load(), r.reversePublic.Load(),
 			r.jwksSuccess.Load(), r.jwksError.Load(),
@@ -206,5 +267,7 @@ func (r *Registry) Handler() http.Handler {
 			r.umaAllowed.Load(), r.umaDenied.Load(), r.umaError.Load(),
 			r.oidcStarted.Load(), r.oidcSuccess.Load(), r.oidcError.Load(), r.oidcRefreshed.Load(), r.oidcLogout.Load(),
 		)
+		r.forwardDuration.writePrometheus(w, "forward_auth")
+		r.reverseDuration.writePrometheus(w, "reverse_proxy")
 	})
 }

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,13 +15,17 @@ import (
 
 type Config struct {
 	Issuer               string
+	AllowedIssuers       []string
 	Audience             string
 	UpstreamURL          string
 	ListenAddr           string
 	MetricsAddr          string
 	LogLevel             string
+	AccessLog            bool
+	TrustedProxies       []string
 	ClientID             string
 	ClientSecret         string
+	ClientSecretFile     string
 	HeaderUser           string
 	HeaderEmail          string
 	HeaderGroups         string
@@ -42,6 +47,7 @@ type Config struct {
 	JWKSRefreshInterval  time.Duration
 	ClockSkew            time.Duration
 	TokenCacheSize       int
+	ShutdownDrainDelay   time.Duration
 
 	// TLS & Timeouts (Milestone 1 + mTLS)
 	KeycloakCAFile          string
@@ -70,19 +76,29 @@ type Config struct {
 	AllowCORSPreflight    bool
 	RouteRules            []string
 
-	// OIDC Browser SSO (Milestone 3 + Multi-Domain / Backchannel Logout)
-	OIDCEnabled                bool
-	OIDCRedirectURL            string
-	OIDCPostLogoutURL          string
-	OIDCCookieSecret           string
-	OIDCCookieName             string
-	OIDCCookieDomain           string
-	OIDCCookieSecure           bool
-	OIDCCookieSameSite         http.SameSite
-	OIDCScopes                 []string
-	OIDCSessionMaxAge          time.Duration
-	OIDCRedirectUnauth         bool
-	OIDCAllowedRedirectDomains []string
+	// OIDC Browser SSO (Milestone 3 + Multi-Domain / Backchannel Logout / Dual-Key Rotation)
+	OIDCEnabled                  bool
+	OIDCRedirectURL              string
+	OIDCPostLogoutURL            string
+	OIDCCookieSecret             string
+	OIDCCookieSecretFile         string
+	OIDCCookieSecretPrevious     string
+	OIDCCookieSecretPreviousFile string
+	OIDCCookieName               string
+	OIDCCookieDomain             string
+	OIDCCookieSecure             bool
+	OIDCCookieSameSite           http.SameSite
+	OIDCScopes                   []string
+	OIDCSessionMaxAge            time.Duration
+	OIDCRedirectUnauth           bool
+	OIDCAllowedRedirectDomains   []string
+
+	// Shared Multi-Replica Revocation Store (Redis / Valkey)
+	RedisAddr         string
+	RedisPassword     string
+	RedisPasswordFile string
+	RedisTLS          bool
+	RedisCAFile       string
 }
 
 func Load() (Config, error) {
@@ -204,10 +220,22 @@ func Load() (Config, error) {
 			return Config{}, err
 		}
 	}
+	overrideStr(&c.ClientSecretFile, "CLIENT_SECRET_FILE")
+	overrideStr(&c.OIDCCookieSecretFile, "OIDC_COOKIE_SECRET_FILE")
+	overrideStr(&c.OIDCCookieSecretPrevious, "OIDC_COOKIE_SECRET_PREVIOUS")
+	overrideStr(&c.OIDCCookieSecretPreviousFile, "OIDC_COOKIE_SECRET_PREVIOUS_FILE")
+	overrideStr(&c.RedisAddr, "REDIS_ADDR")
+	overrideStr(&c.RedisPassword, "REDIS_PASSWORD")
+	overrideStr(&c.RedisPasswordFile, "REDIS_PASSWORD_FILE")
+	overrideStr(&c.RedisCAFile, "REDIS_CA_FILE")
+	overrideCSV(&c.AllowedIssuers, "ALLOWED_ISSUERS")
+	overrideCSV(&c.TrustedProxies, "TRUSTED_PROXIES")
 	for _, item := range []struct {
 		dst *bool
 		env string
 	}{
+		{&c.AccessLog, "ACCESS_LOG"},
+		{&c.RedisTLS, "REDIS_TLS"},
 		{&c.PassAccessToken, "PASS_ACCESS_TOKEN"},
 		{&c.RequireEmailVerified, "REQUIRE_EMAIL_VERIFIED"},
 		{&c.IntrospectionEnabled, "INTROSPECTION_ENABLED"},
@@ -233,6 +261,7 @@ func Load() (Config, error) {
 	}{
 		{&c.JWKSRefreshInterval, "JWKS_REFRESH_INTERVAL"},
 		{&c.ClockSkew, "CLOCK_SKEW"},
+		{&c.ShutdownDrainDelay, "SHUTDOWN_DRAIN_DELAY"},
 		{&c.ServerReadHeaderTimeout, "SERVER_READ_HEADER_TIMEOUT"},
 		{&c.ServerReadTimeout, "SERVER_READ_TIMEOUT"},
 		{&c.ServerWriteTimeout, "SERVER_WRITE_TIMEOUT"},
@@ -258,10 +287,55 @@ func Load() (Config, error) {
 		}
 		c.TokenCacheSize = n
 	}
+	if err = c.resolveSecretFiles(); err != nil {
+		return Config{}, err
+	}
 	if err = c.Validate(); err != nil {
 		return Config{}, err
 	}
 	return c, nil
+}
+
+func readSecretFile(path string) (string, error) {
+	// #nosec G304,G703 -- secret file paths are explicitly configured by the operator at startup.
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	const maxSecretFileBytes = 64 << 10
+	data, err := io.ReadAll(io.LimitReader(f, maxSecretFileBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxSecretFileBytes {
+		return "", errors.New("secret file exceeds 64 KiB limit")
+	}
+	return strings.TrimRight(string(data), "\r\n"), nil
+}
+
+func (c *Config) resolveSecretFiles() error {
+	for _, item := range []struct {
+		dst  *string
+		file string
+		env  string
+		name string
+	}{
+		{&c.ClientSecret, c.ClientSecretFile, "CLIENT_SECRET", "CLIENT_SECRET_FILE"},
+		{&c.OIDCCookieSecret, c.OIDCCookieSecretFile, "OIDC_COOKIE_SECRET", "OIDC_COOKIE_SECRET_FILE"},
+		{&c.OIDCCookieSecretPrevious, c.OIDCCookieSecretPreviousFile, "OIDC_COOKIE_SECRET_PREVIOUS", "OIDC_COOKIE_SECRET_PREVIOUS_FILE"},
+		{&c.RedisPassword, c.RedisPasswordFile, "REDIS_PASSWORD", "REDIS_PASSWORD_FILE"},
+	} {
+		if item.file == "" || os.Getenv(item.env) != "" {
+			continue
+		}
+		val, err := readSecretFile(item.file)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", item.name, err)
+		}
+		*item.dst = val
+	}
+	return nil
 }
 
 func csvList(value string) []string {
@@ -327,8 +401,20 @@ func parseSameSite(value string) (http.SameSite, error) {
 }
 
 func (c Config) Validate() error {
-	if err := validURL(c.Issuer); err != nil {
+	if c.Issuer != "" {
+		if err := validURL(c.Issuer); err != nil {
+			return errors.New("ISSUER must be an absolute HTTP(S) URL without credentials, query, or fragment")
+		}
+	} else if len(c.AllowedIssuers) == 0 {
 		return errors.New("ISSUER must be an absolute HTTP(S) URL without credentials, query, or fragment")
+	}
+	for _, iss := range c.AllowedIssuers {
+		if err := validURL(iss); err != nil {
+			return errors.New("ALLOWED_ISSUERS entries must be absolute HTTP(S) URLs without credentials, query, or fragment")
+		}
+	}
+	if len(c.AllowedIssuers) > 0 && c.Issuer == "" && (c.OIDCEnabled || c.IntrospectionEnabled || c.UMAEnabled) {
+		return errors.New("ISSUER is required when OIDC_ENABLED, INTROSPECTION_ENABLED, or UMA_ENABLED is true")
 	}
 	if c.Audience == "" || strings.TrimSpace(c.Audience) != c.Audience {
 		return errors.New("AUDIENCE is required")
@@ -346,6 +432,11 @@ func (c Config) Validate() error {
 			return errors.New("invalid METRICS_ADDR")
 		}
 	}
+	if c.RedisAddr != "" {
+		if _, _, err := net.SplitHostPort(c.RedisAddr); err != nil {
+			return errors.New("invalid REDIS_ADDR")
+		}
+	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		return errors.New("TLS_CERT_FILE and TLS_KEY_FILE must both be set")
 	}
@@ -360,6 +451,9 @@ func (c Config) Validate() error {
 	}
 	if c.ClockSkew < 0 || c.ClockSkew > 30*time.Second {
 		return errors.New("CLOCK_SKEW must be between 0 and 30s")
+	}
+	if c.ShutdownDrainDelay < 0 || c.ShutdownDrainDelay > 5*time.Minute {
+		return errors.New("SHUTDOWN_DRAIN_DELAY must be between 0 and 5m")
 	}
 	if c.ServerReadHeaderTimeout < 0 || c.ServerReadTimeout < 0 || c.ServerWriteTimeout < 0 ||
 		c.ServerIdleTimeout < 0 || c.UpstreamHeaderTimeout < 0 || c.UpstreamRequestTimeout < 0 {
@@ -385,6 +479,9 @@ func (c Config) Validate() error {
 		}
 		if len(c.OIDCCookieSecret) < 32 {
 			return errors.New("OIDC_COOKIE_SECRET must be at least 32 characters when OIDC_ENABLED=true")
+		}
+		if c.OIDCCookieSecretPrevious != "" && len(c.OIDCCookieSecretPrevious) < 32 {
+			return errors.New("OIDC_COOKIE_SECRET_PREVIOUS must be at least 32 characters when set")
 		}
 		if err := validURL(c.OIDCRedirectURL); err != nil {
 			return errors.New("OIDC_REDIRECT_URL must be an absolute HTTP(S) URL when OIDC_ENABLED=true")

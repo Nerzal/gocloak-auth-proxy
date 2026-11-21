@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -10,14 +11,19 @@ import (
 )
 
 type fileConfig struct {
+	Schema               *string           `json:"$schema"`
 	Issuer               *string           `json:"issuer"`
+	AllowedIssuers       []string          `json:"allowed_issuers"`
 	Audience             *string           `json:"audience"`
 	UpstreamURL          *string           `json:"upstream_url"`
 	ListenAddr           *string           `json:"listen_addr"`
 	MetricsAddr          *string           `json:"metrics_addr"`
 	LogLevel             *string           `json:"log_level"`
+	AccessLog            *bool             `json:"access_log"`
+	TrustedProxies       []string          `json:"trusted_proxies"`
 	ClientID             *string           `json:"client_id"`
 	ClientSecret         *string           `json:"client_secret"`
+	ClientSecretFile     *string           `json:"client_secret_file"`
 	HeaderUser           *string           `json:"header_user"`
 	HeaderEmail          *string           `json:"header_email"`
 	HeaderGroups         *string           `json:"header_groups"`
@@ -39,6 +45,7 @@ type fileConfig struct {
 	JWKSRefreshInterval  *string           `json:"jwks_refresh_interval"`
 	ClockSkew            *string           `json:"clock_skew"`
 	TokenCacheSize       *int              `json:"token_cache_size"`
+	ShutdownDrainDelay   *string           `json:"shutdown_drain_delay"`
 
 	KeycloakCAFile          *string `json:"keycloak_ca_file"`
 	KeycloakClientCertFile  *string `json:"keycloak_client_cert_file"`
@@ -64,18 +71,27 @@ type fileConfig struct {
 	AllowCORSPreflight    *bool    `json:"allow_cors_preflight"`
 	RouteRules            []string `json:"route_rules"`
 
-	OIDCEnabled                *bool    `json:"oidc_enabled"`
-	OIDCRedirectURL            *string  `json:"oidc_redirect_url"`
-	OIDCPostLogoutURL          *string  `json:"oidc_post_logout_url"`
-	OIDCCookieSecret           *string  `json:"oidc_cookie_secret"`
-	OIDCCookieName             *string  `json:"oidc_cookie_name"`
-	OIDCCookieDomain           *string  `json:"oidc_cookie_domain"`
-	OIDCCookieSecure           *bool    `json:"oidc_cookie_secure"`
-	OIDCCookieSameSite         *string  `json:"oidc_cookie_samesite"`
-	OIDCScopes                 []string `json:"oidc_scopes"`
-	OIDCSessionMaxAge          *string  `json:"oidc_session_max_age"`
-	OIDCRedirectUnauth         *bool    `json:"oidc_redirect"`
-	OIDCAllowedRedirectDomains []string `json:"oidc_allowed_redirect_domains"`
+	OIDCEnabled                  *bool    `json:"oidc_enabled"`
+	OIDCRedirectURL              *string  `json:"oidc_redirect_url"`
+	OIDCPostLogoutURL            *string  `json:"oidc_post_logout_url"`
+	OIDCCookieSecret             *string  `json:"oidc_cookie_secret"`
+	OIDCCookieSecretFile         *string  `json:"oidc_cookie_secret_file"`
+	OIDCCookieSecretPrevious     *string  `json:"oidc_cookie_secret_previous"`
+	OIDCCookieSecretPreviousFile *string  `json:"oidc_cookie_secret_previous_file"`
+	OIDCCookieName               *string  `json:"oidc_cookie_name"`
+	OIDCCookieDomain             *string  `json:"oidc_cookie_domain"`
+	OIDCCookieSecure             *bool    `json:"oidc_cookie_secure"`
+	OIDCCookieSameSite           *string  `json:"oidc_cookie_samesite"`
+	OIDCScopes                   []string `json:"oidc_scopes"`
+	OIDCSessionMaxAge            *string  `json:"oidc_session_max_age"`
+	OIDCRedirectUnauth           *bool    `json:"oidc_redirect"`
+	OIDCAllowedRedirectDomains   []string `json:"oidc_allowed_redirect_domains"`
+
+	RedisAddr         *string `json:"redis_addr"`
+	RedisPassword     *string `json:"redis_password"`
+	RedisPasswordFile *string `json:"redis_password_file"`
+	RedisTLS          *bool   `json:"redis_tls"`
+	RedisCAFile       *string `json:"redis_ca_file"`
 }
 
 func applyConfigFile(path string, c *Config) error {
@@ -250,7 +266,65 @@ func applyConfigFile(path string, c *Config) error {
 	if fc.OIDCAllowedRedirectDomains != nil {
 		c.OIDCAllowedRedirectDomains = fc.OIDCAllowedRedirectDomains
 	}
+	if fc.AllowedIssuers != nil {
+		c.AllowedIssuers = fc.AllowedIssuers
+	}
+	setBool(&c.AccessLog, fc.AccessLog)
+	if fc.TrustedProxies != nil {
+		c.TrustedProxies = fc.TrustedProxies
+	}
+	setStr(&c.ClientSecretFile, fc.ClientSecretFile)
+	setStr(&c.OIDCCookieSecretFile, fc.OIDCCookieSecretFile)
+	setStr(&c.OIDCCookieSecretPrevious, fc.OIDCCookieSecretPrevious)
+	setStr(&c.OIDCCookieSecretPreviousFile, fc.OIDCCookieSecretPreviousFile)
+	if err := setDur(&c.ShutdownDrainDelay, fc.ShutdownDrainDelay, "shutdown_drain_delay"); err != nil {
+		return err
+	}
+	setStr(&c.RedisAddr, fc.RedisAddr)
+	setStr(&c.RedisPassword, fc.RedisPassword)
+	setStr(&c.RedisPasswordFile, fc.RedisPasswordFile)
+	setBool(&c.RedisTLS, fc.RedisTLS)
+	setStr(&c.RedisCAFile, fc.RedisCAFile)
 	return nil
+}
+
+// EffectiveIssuers returns the deduplicated list of configured realm issuers.
+func (c Config) EffectiveIssuers() []string {
+	var out []string
+	seen := make(map[string]struct{}, 1+len(c.AllowedIssuers))
+	if c.Issuer != "" {
+		seen[c.Issuer] = struct{}{}
+		out = append(out, c.Issuer)
+	}
+	for _, iss := range c.AllowedIssuers {
+		if iss == "" {
+			continue
+		}
+		if _, ok := seen[iss]; !ok {
+			seen[iss] = struct{}{}
+			out = append(out, iss)
+		}
+	}
+	return out
+}
+
+// RedactedJSON marshals the effective configuration as indented JSON with all
+// secret values replaced by "[REDACTED]".
+func (c Config) RedactedJSON() ([]byte, error) {
+	redact := func(s string) string {
+		if s != "" {
+			return "[REDACTED]"
+		}
+		return ""
+	}
+	c.ClientSecret = redact(c.ClientSecret)
+	c.OIDCCookieSecret = redact(c.OIDCCookieSecret)
+	c.OIDCCookieSecretPrevious = redact(c.OIDCCookieSecretPrevious)
+	c.RedisPassword = redact(c.RedisPassword)
+	durMarshaler := json.MarshalFunc(func(d time.Duration) ([]byte, error) {
+		return json.Marshal(d.String())
+	})
+	return json.Marshal(c, jsontext.WithIndent("  "), json.WithMarshalers(durMarshaler))
 }
 
 func parseMatchModeValue(name, raw string) (bool, error) {

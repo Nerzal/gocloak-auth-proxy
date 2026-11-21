@@ -63,6 +63,7 @@ type Config struct {
 	RedirectURL             string // e.g. https://app.example.com/oauth2/callback
 	PostLogoutURL           string // optional; defaults to "/"
 	CookieSecret            string // minimum 32 bytes
+	CookieSecretPrevious    string // optional previous secret for zero-downtime cookie rotation (min 32 bytes)
 	CookieName              string // optional; defaults to __Host-gocloak_session (or gocloak_session if !CookieSecure or CookieDomain != "")
 	CookieDomain            string // optional; e.g. .example.com for multi-subdomain SSO (incompatible with __Host- prefix)
 	CookieSecure            bool
@@ -77,6 +78,7 @@ type Config struct {
 	TLSConfig               *tls.Config
 	Logger                  *slog.Logger
 	OnEvent                 func(event string)
+	RevocationStore         RevocationStore // optional shared store (e.g. Redis/Valkey) for multi-replica logout
 }
 
 type authState struct {
@@ -127,6 +129,7 @@ type Manager struct {
 	redirectUnauth         bool
 	allowedRedirectDomains []string
 	aead                   cipher.AEAD
+	prevAEAD               cipher.AEAD
 	httpClient             *http.Client
 	kcClient               *gocloak.GoCloak
 	verifier               TokenVerifier
@@ -134,6 +137,7 @@ type Manager struct {
 	logoutParser           *jwt.Parser
 	logger                 *slog.Logger
 	onEvent                func(string)
+	revocationStore        RevocationStore
 
 	refreshMu      sync.Mutex
 	refreshFlights map[[32]byte]*refreshFlight
@@ -206,6 +210,21 @@ func New(cfg Config, verifier TokenVerifier) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	var prevAEAD cipher.AEAD
+	if cfg.CookieSecretPrevious != "" {
+		if len(cfg.CookieSecretPrevious) < 32 {
+			return nil, errors.New("OIDC_COOKIE_SECRET_PREVIOUS must be at least 32 characters")
+		}
+		prevKey := sha256.Sum256([]byte(cfg.CookieSecretPrevious))
+		prevBlock, err := aes.NewCipher(prevKey[:])
+		if err != nil {
+			return nil, err
+		}
+		prevAEAD, err = cipher.NewGCM(prevBlock)
+		if err != nil {
+			return nil, err
+		}
+	}
 	transport := keycloak.NewBoundedTransport(cfg.TLSConfig, maxTokenRespBytes)
 	httpClient := &http.Client{
 		Transport: transport,
@@ -264,6 +283,7 @@ func New(cfg Config, verifier TokenVerifier) (*Manager, error) {
 		redirectUnauth:         cfg.RedirectUnauthenticated,
 		allowedRedirectDomains: allowedDomains,
 		aead:                   aead,
+		prevAEAD:               prevAEAD,
 		httpClient:             httpClient,
 		kcClient:               kcClient,
 		verifier:               verifier,
@@ -271,6 +291,7 @@ func New(cfg Config, verifier TokenVerifier) (*Manager, error) {
 		logoutParser:           logoutParser,
 		logger:                 logger,
 		onEvent:                cfg.OnEvent,
+		revocationStore:        cfg.RevocationStore,
 		refreshFlights:         make(map[[32]byte]*refreshFlight),
 		refreshCache:           make(map[[32]byte]refreshCacheEntry),
 		revokedSIDs:            make(map[string]time.Time),
@@ -896,7 +917,15 @@ func (m *Manager) openJSON(encoded string, aad []byte, dst any) error {
 	raw := cb.buf[:n]
 	nonce := raw[:m.aead.NonceSize()]
 	ciphertext := raw[m.aead.NonceSize():]
-	plain, err := m.aead.Open(ciphertext[:0], nonce, ciphertext, aad)
+	var plain []byte
+	if m.prevAEAD == nil {
+		plain, err = m.aead.Open(ciphertext[:0], nonce, ciphertext, aad)
+	} else {
+		plain, err = m.aead.Open(nil, nonce, ciphertext, aad)
+		if err != nil {
+			plain, err = m.prevAEAD.Open(ciphertext[:0], nonce, ciphertext, aad)
+		}
+	}
 	if err != nil {
 		return errors.New("cookie authentication failed")
 	}

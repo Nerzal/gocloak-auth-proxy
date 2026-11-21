@@ -240,7 +240,7 @@ func NewWithOptions(keys KeySource, opts Options) (*Verifier, error) {
 func (v *Verifier) Verify(ctx context.Context, authorization string) (Identity, error) {
 	scheme, raw, ok := strings.Cut(authorization, " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") || len(raw) == 0 || len(raw) > 65536 {
-		return Identity{}, errInvalid
+		return Identity{}, invalidWith("invalid_bearer_header")
 	}
 
 	var tokenHash [32]byte
@@ -253,7 +253,7 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Identity, 
 					if v.introspector != nil {
 						active, err := v.introspector.Active(ctx, raw)
 						if err != nil || !active {
-							return Identity{}, errInvalid
+							return Identity{}, invalidWith("introspection_inactive")
 						}
 					}
 					return entry.identity, nil
@@ -264,39 +264,45 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Identity, 
 
 	hdrPart, payloadPart, sigPart, signingInput, ok := splitJWT(raw)
 	if !ok {
-		return Identity{}, errInvalid
+		return Identity{}, invalidWith("malformed_jwt")
 	}
 
 	db := getDecodeBuf()
 	defer putDecodeBuf(db)
 
 	alg, kid, err := parseJWSHeader(db, hdrPart)
-	if err != nil || !slices.Contains(v.allowedAlgs, alg) || kid == "" || len(kid) > 256 || !safeHeaderValue(kid) {
-		return Identity{}, errInvalid
+	if err != nil {
+		return Identity{}, invalidWith("invalid_header")
+	}
+	if !slices.Contains(v.allowedAlgs, alg) {
+		return Identity{}, invalidWith("disallowed_algorithm")
+	}
+	if kid == "" || len(kid) > 256 || !safeHeaderValue(kid) {
+		return Identity{}, invalidWith("invalid_kid")
 	}
 
 	key, err := v.keys.Key(ctx, kid, alg)
 	if err != nil || !validPublicKey(alg, key) {
-		return Identity{}, errInvalid
+		return Identity{}, invalidWith("unknown_key")
 	}
 
 	if err := verifyJWSSignature(alg, key, signingInput, sigPart, db); err != nil {
-		return Identity{}, errInvalid
+		return Identity{}, invalidWith("invalid_signature")
 	}
 
 	c, err := parseJWTPayload(db, payloadPart, v.clientID, v.customByClaim)
 	if err != nil {
-		return Identity{}, errInvalid
+		return Identity{}, invalidWith("invalid_payload")
 	}
 	if len(v.customByClaim) > 0 {
 		if err := populateStandardCustomClaims(&c, v.customByClaim); err != nil {
-			return Identity{}, errInvalid
+			return Identity{}, invalidWith("invalid_custom_claim")
 		}
 	}
 
 	nowSec := float64(time.Now().UnixNano()) / 1e9
-	if !v.validRegisteredClaims(c, nowSec) {
-		return Identity{}, errInvalid
+	if reason := v.validateRegisteredClaims(c, nowSec); reason != "" {
+		return Identity{}, invalidWith(reason)
 	}
 
 	id, err := v.identity(c, raw)
@@ -319,29 +325,38 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Identity, 
 	if v.introspector != nil {
 		active, err := v.introspector.Active(ctx, raw)
 		if err != nil || !active {
-			return Identity{}, errInvalid
+			return Identity{}, invalidWith("introspection_inactive")
 		}
 	}
 	return id, nil
 }
 
-func (v *Verifier) validRegisteredClaims(c parsedClaims, nowSec float64) bool {
-	if c.typ != "Bearer" || c.issuer != v.issuer || !slices.Contains(c.audience, v.audience) {
-		return false
+func (v *Verifier) validateRegisteredClaims(c parsedClaims, nowSec float64) string {
+	if c.typ != "Bearer" {
+		return "wrong_token_type"
 	}
-	if !c.hasExp || !c.hasIat {
-		return false
+	if c.issuer != v.issuer {
+		return "issuer_mismatch"
+	}
+	if !slices.Contains(c.audience, v.audience) {
+		return "audience_mismatch"
+	}
+	if !c.hasExp {
+		return "missing_exp"
+	}
+	if !c.hasIat {
+		return "missing_iat"
 	}
 	if nowSec > c.exp+v.skewSec {
-		return false
+		return "expired"
 	}
 	if c.iat > nowSec+v.skewSec {
-		return false
+		return "invalid_iat"
 	}
 	if c.hasNbf && c.nbf > nowSec+v.skewSec {
-		return false
+		return "not_yet_valid"
 	}
-	return true
+	return ""
 }
 
 func validPublicKey(alg string, key any) bool {
@@ -433,14 +448,14 @@ func (v *Verifier) identity(c parsedClaims, raw string) (Identity, error) {
 		user = c.subject
 	}
 	if strings.TrimSpace(user) == "" {
-		return Identity{}, errInvalid
+		return Identity{}, invalidWith("missing_subject")
 	}
 	roles := uniqueRoles(c.realmRoles, c.clientRoles)
 	if !safeHeaderValue(user) || !safeHeaderValue(c.email) || !safeValues(c.groups) || !safeValues(roles) {
-		return Identity{}, errInvalid
+		return Identity{}, invalidWith("unsafe_claim_value")
 	}
-	if !v.authorize(c) {
-		return Identity{}, ErrForbidden
+	if reason := v.authorizeReason(c); reason != "" {
+		return Identity{}, forbiddenWith(reason)
 	}
 	return Identity{
 		User:        user,
@@ -458,38 +473,38 @@ func (v *Verifier) identity(c parsedClaims, raw string) (Identity, error) {
 	}, nil
 }
 
-func (v *Verifier) authorize(c parsedClaims) bool {
+func (v *Verifier) authorizeReason(c parsedClaims) string {
 	if !matchValues(c.realmRoles, v.realmRoles, v.requireAnyRole) {
-		return false
+		return "missing_realm_role"
 	}
 	if !matchValues(c.clientRoles, v.clientRoles, v.requireAnyRole) {
-		return false
+		return "missing_client_role"
 	}
 	if !matchValues(c.groups, v.requiredGroups, v.requireAnyGroup) {
-		return false
+		return "missing_group"
 	}
 	if len(v.requiredScopes) > 0 {
 		tokenScopes := strings.Fields(c.scope)
 		if !matchValues(tokenScopes, v.requiredScopes, false) {
-			return false
+			return "missing_scope"
 		}
 	}
 	if len(v.requiredACR) > 0 && !slices.Contains(v.requiredACR, c.acr) {
-		return false
+		return "invalid_acr"
 	}
 	if len(v.requiredAMR) > 0 && !matchValues(c.amr, v.requiredAMR, false) {
-		return false
+		return "missing_amr"
 	}
 	if v.requireEmailVerified && !c.emailVerified {
-		return false
+		return "email_unverified"
 	}
 	if v.requiredAZP != "" && c.azp != v.requiredAZP {
-		return false
+		return "azp_mismatch"
 	}
 	if v.requiredOrg != "" && !slices.Contains(c.organization, v.requiredOrg) {
-		return false
+		return "organization_mismatch"
 	}
-	return true
+	return ""
 }
 
 func safeHeaderValue(s string) bool {

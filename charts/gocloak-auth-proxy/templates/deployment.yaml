@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gocloak-auth-proxy.fullname" . }}
+  labels:
+    {{- include "gocloak-auth-proxy.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gocloak-auth-proxy.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "gocloak-auth-proxy.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "gocloak-auth-proxy.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: LISTEN_ADDR
+              value: ":8080"
+            {{- if .Values.metrics.enabled }}
+            - name: METRICS_ADDR
+              value: ":9090"
+            {{- end }}
+            {{- if .Values.config.issuer }}
+            - name: ISSUER
+              value: {{ .Values.config.issuer | quote }}
+            {{- end }}
+            {{- if .Values.config.allowedIssuers }}
+            - name: ALLOWED_ISSUERS
+              value: {{ .Values.config.allowedIssuers | quote }}
+            {{- end }}
+            {{- if .Values.config.audience }}
+            - name: AUDIENCE
+              value: {{ .Values.config.audience | quote }}
+            {{- end }}
+            {{- if .Values.config.upstreamUrl }}
+            - name: UPSTREAM_URL
+              value: {{ .Values.config.upstreamUrl | quote }}
+            {{- end }}
+            {{- if .Values.config.clientId }}
+            - name: CLIENT_ID
+              value: {{ .Values.config.clientId | quote }}
+            {{- end }}
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            - name: ACCESS_LOG
+              value: {{ .Values.config.accessLog | quote }}
+            - name: TOKEN_CACHE_SIZE
+              value: {{ .Values.config.tokenCacheSize | quote }}
+            - name: SHUTDOWN_DRAIN_DELAY
+              value: {{ .Values.config.shutdownDrainDelay | quote }}
+            {{- if .Values.config.trustedProxies }}
+            - name: TRUSTED_PROXIES
+              value: {{ .Values.config.trustedProxies | quote }}
+            {{- end }}
+            {{- with .Values.config.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              scheme: {{ .Values.probes.scheme | default "HTTP" }}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+              scheme: {{ .Values.probes.scheme | default "HTTP" }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

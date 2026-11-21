@@ -1,0 +1,13 @@
+gocloak-auth-proxy has been deployed!
+
+Forward-Auth endpoint (when config.upstreamUrl is empty):
+  http://{{ include "gocloak-auth-proxy.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/auth
+
+Health / Readiness probes:
+  /healthz (liveness)
+  /readyz  (readiness — flips to 503 during SHUTDOWN_DRAIN_DELAY)
+{{- if .Values.metrics.enabled }}
+
+Prometheus metrics (internal only):
+  http://{{ include "gocloak-auth-proxy.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.metricsPort }}/metrics
+{{- end }}

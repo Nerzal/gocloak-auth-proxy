@@ -1,0 +1,94 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/nerzal/gocloak-auth-proxy
+  pullPolicy: IfNotPresent
+  tag: "" # defaults to Chart.appVersion
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8080
+  metricsPort: 9090
+
+# Proxy configuration (non-secret values)
+config:
+  issuer: ""
+  allowedIssuers: ""
+  audience: ""
+  upstreamUrl: ""
+  clientId: ""
+  logLevel: "info"
+  accessLog: false
+  tokenCacheSize: 4096
+  shutdownDrainDelay: "5s"
+  trustedProxies: ""
+  extraEnv: []
+
+# Reference an existing Kubernetes Secret containing CLIENT_SECRET / OIDC_COOKIE_SECRET / etc.
+existingSecret: ""
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 75
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+terminationGracePeriodSeconds: 30
+
+probes:
+  scheme: HTTP # Set to HTTPS when TLS_CERT_FILE / TLS_KEY_FILE are mounted
+
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

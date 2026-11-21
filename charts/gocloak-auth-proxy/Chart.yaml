@@ -1,0 +1,17 @@
+apiVersion: v2
+name: gocloak-auth-proxy
+description: Security-first, high-performance Go authentication proxy for Keycloak (Forward-Auth, Reverse-Proxy, OIDC Browser SSO)
+type: application
+version: 0.3.0
+appVersion: "0.3.0"
+home: https://github.com/Nerzal/gocloak-auth-proxy
+sources:
+  - https://github.com/Nerzal/gocloak-auth-proxy
+keywords:
+  - keycloak
+  - oidc
+  - oauth2
+  - auth-proxy
+  - forward-auth
+  - reverse-proxy
+  - gocloak
